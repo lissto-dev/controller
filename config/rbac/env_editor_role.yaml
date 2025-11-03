@@ -1,0 +1,32 @@
+# This rule is not used by the project operator itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants edit permissions over env.lissto.dev envs.
+# This role allows users to create and update envs, but not delete them.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: env-editor-role
+rules:
+- apiGroups:
+  - env.lissto.dev
+  resources:
+  - envs
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+- apiGroups:
+  - env.lissto.dev
+  resources:
+  - envs/status
+  verbs:
+  - get
+

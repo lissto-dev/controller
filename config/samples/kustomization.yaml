@@ -1,0 +1,8 @@
+## Append samples of your project ##
+resources:
+- env_v1_stack.yaml
+- env_v1_blueprint.yaml
+- env_v1_stacklifecycle.yaml
+- env_v1alpha1_blueprint.yaml
+- env_v1alpha1_stack.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

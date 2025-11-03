@@ -1,0 +1,47 @@
+apiVersion: env.lissto.dev/v1
+kind: Blueprint
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: blueprint-sample-1
+  namespace: dev-daniel
+spec:
+  data: |
+    file=456
+---
+apiVersion: env.lissto.dev/v1
+kind: Blueprint
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: blueprint-sample-2
+  namespace: dev-daniel
+spec:
+  data: |
+    file=123
+---
+apiVersion: env.lissto.dev/v1
+kind: Blueprint
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: blueprint-main-1
+  namespace: lissto
+spec:
+  data: |
+    file=456
+---
+apiVersion: env.lissto.dev/v1
+kind: Blueprint
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: blueprint-main-2
+  namespace: lissto
+spec:
+  data: |
+    file=123

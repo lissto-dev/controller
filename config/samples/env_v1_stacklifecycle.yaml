@@ -1,0 +1,9 @@
+apiVersion: env.lissto.dev/v1
+kind: StackLifecycle
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: stacklifecycle-sample
+spec:
+  # TODO(user): Add fields here
