@@ -27,7 +27,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	envv1alpha1 "github.com/lissto.dev/controller/api/v1alpha1"
+	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
 )
 
 var _ = Describe("Stack Controller", func() {

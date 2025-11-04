@@ -7,7 +7,7 @@ domain: lissto.dev
 layout:
 - go.kubebuilder.io/v4
 projectName: operator
-repo: github.com/lissto.dev/controller
+repo: github.com/lissto-dev/controller
 resources:
 - api:
     crdVersion: v1
@@ -16,7 +16,7 @@ resources:
   domain: lissto.dev
   group: env
   kind: Stack
-  path: github.com/lissto.dev/controller/api/v1
+  path: github.com/lissto-dev/controller/api/v1
   version: v1
 - api:
     crdVersion: v1
@@ -25,7 +25,7 @@ resources:
   domain: lissto.dev
   group: env
   kind: Blueprint
-  path: github.com/lissto.dev/controller/api/v1
+  path: github.com/lissto-dev/controller/api/v1
   version: v1
 - api:
     crdVersion: v1
@@ -34,7 +34,7 @@ resources:
   domain: lissto.dev
   group: env
   kind: StackLifecycle
-  path: github.com/lissto.dev/controller/api/v1
+  path: github.com/lissto-dev/controller/api/v1
   version: v1
 - api:
     crdVersion: v1
@@ -42,7 +42,7 @@ resources:
   domain: lissto.dev
   group: env
   kind: Blueprint
-  path: github.com/lissto.dev/controller/api/v1alpha1
+  path: github.com/lissto-dev/controller/api/v1alpha1
   version: v1alpha1
 - api:
     crdVersion: v1
@@ -50,6 +50,6 @@ resources:
   domain: lissto.dev
   group: env
   kind: Stack
-  path: github.com/lissto.dev/controller/api/v1alpha1
+  path: github.com/lissto-dev/controller/api/v1alpha1
   version: v1alpha1
 version: "3"

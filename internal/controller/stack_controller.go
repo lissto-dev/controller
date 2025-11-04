@@ -27,8 +27,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	envv1alpha1 "github.com/lissto.dev/controller/api/v1alpha1"
-	"github.com/lissto.dev/controller/pkg/config"
+	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
+	"github.com/lissto-dev/controller/pkg/config"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"

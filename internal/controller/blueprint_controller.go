@@ -24,8 +24,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	envv1alpha1 "github.com/lissto.dev/controller/api/v1alpha1"
-	"github.com/lissto.dev/controller/pkg/config"
+	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
+	"github.com/lissto-dev/controller/pkg/config"
 )
 
 // BlueprintReconciler reconciles a Blueprint object

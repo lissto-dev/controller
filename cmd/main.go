@@ -35,9 +35,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	envv1alpha1 "github.com/lissto.dev/controller/api/v1alpha1"
-	"github.com/lissto.dev/controller/internal/controller"
-	"github.com/lissto.dev/controller/pkg/config"
+	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
+	"github.com/lissto-dev/controller/internal/controller"
+	"github.com/lissto-dev/controller/pkg/config"
 	// +kubebuilder:scaffold:imports
 )
 
