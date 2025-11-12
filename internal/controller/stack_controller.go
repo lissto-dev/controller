@@ -94,6 +94,9 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 	log.Info("Parsed manifests", "count", len(objects))
 
+	// Inject images from Stack spec into deployments
+	r.injectImages(ctx, objects, stack.Spec.Images)
+
 	// Apply all resources
 	results := r.applyResources(ctx, objects, stack.Namespace)
 
@@ -131,6 +134,58 @@ func (r *StackReconciler) fetchManifests(ctx context.Context, namespace, configM
 	}
 
 	return manifests, nil
+}
+
+// injectImages updates deployment container images from Stack spec
+func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructured.Unstructured, images map[string]envv1alpha1.ImageInfo) {
+	log := logf.FromContext(ctx)
+
+	for _, obj := range objects {
+		// Only process Deployments
+		if obj.GetKind() != "Deployment" {
+			continue
+		}
+
+		deploymentName := obj.GetName()
+
+		// Get the containers array from spec.template.spec.containers
+		containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+		if err != nil || !found {
+			log.Error(err, "Failed to get containers from Deployment", "name", deploymentName)
+			continue
+		}
+
+		// Update each container's image if we have it in stack.Spec.Images
+		updated := false
+		for i, container := range containers {
+			containerMap, ok := container.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			containerName, _, _ := unstructured.NestedString(containerMap, "name")
+
+			// Check if we have an image for this service/container
+			if imageInfo, exists := images[containerName]; exists {
+				// Use the digest from Stack spec
+				containerMap["image"] = imageInfo.Digest
+				containers[i] = containerMap
+				updated = true
+
+				log.Info("Injected image into Deployment",
+					"deployment", deploymentName,
+					"container", containerName,
+					"image", imageInfo.Digest)
+			}
+		}
+
+		// Write back the updated containers
+		if updated {
+			if err := unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers"); err != nil {
+				log.Error(err, "Failed to set containers in Deployment", "name", deploymentName)
+			}
+		}
+	}
 }
 
 // applyResources applies all resources to cluster using server-side apply
@@ -271,6 +326,8 @@ func (r *StackReconciler) updateStackStatus(ctx context.Context, stack *envv1alp
 		})
 
 		stack.Status.Conditions = conditions
+		// Update ObservedGeneration even on parse failure
+		stack.Status.ObservedGeneration = stack.Generation
 		if err := r.Status().Update(ctx, stack); err != nil {
 			log.Error(err, "Failed to update Stack status")
 		}
@@ -324,6 +381,9 @@ func (r *StackReconciler) updateStackStatus(ctx context.Context, stack *envv1alp
 
 	conditions = append([]metav1.Condition{readyCondition}, conditions...)
 	stack.Status.Conditions = conditions
+
+	// Update ObservedGeneration to indicate this spec version was reconciled
+	stack.Status.ObservedGeneration = stack.Generation
 
 	if err := r.Status().Update(ctx, stack); err != nil {
 		log.Error(err, "Failed to update Stack status")

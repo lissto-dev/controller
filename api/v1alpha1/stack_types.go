@@ -46,22 +46,30 @@ type StackSpec struct {
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
 	// BlueprintReference references the Blueprint resource
+	// This field is immutable after creation
 	// +required
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="blueprintReference is immutable after creation"
 	BlueprintReference string `json:"blueprintReference"`
 
 	// ManifestsConfigMapRef references the ConfigMap containing the generated Kubernetes YAML manifests
+	// This field is immutable after creation
 	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="manifestsConfigMapRef is immutable after creation"
 	ManifestsConfigMapRef string `json:"manifestsConfigMapRef"`
 
 	// Env references the Env resource
+	// This field is immutable after creation
 	// +required
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="env is immutable after creation"
 	Env string `json:"env"`
 
 	// Images contains the service to image information mapping
+	// This is the only mutable field - updates trigger rolling deployments
 	// +required
 	Images map[string]ImageInfo `json:"images"`
 
 	// Metadata contains stack creation metadata
+	// This field is mutable and can be updated to track image sources
 	// +optional
 	Metadata StackMetadata `json:"metadata,omitempty"`
 }
@@ -97,6 +105,11 @@ type StackStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// ObservedGeneration is the generation of the Stack that was most recently reconciled
+	// If this differs from metadata.generation, the spec has changed but hasn't been reconciled yet
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 // +kubebuilder:object:root=true
