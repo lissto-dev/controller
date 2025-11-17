@@ -30,6 +30,7 @@ import (
 	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
 	"github.com/lissto-dev/controller/pkg/config"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -292,9 +293,18 @@ func (r *StackReconciler) setOwnerReferences(ctx context.Context, stack *envv1al
 		}
 
 		if err := r.Update(ctx, obj); err != nil {
-			log.Error(err, "Failed to update resource with owner reference",
-				"kind", obj.GetKind(),
-				"name", obj.GetName())
+			// Check if it's a conflict error (optimistic locking)
+			if apierrors.IsConflict(err) {
+				// Conflict errors are expected and will be retried - log at debug level
+				log.V(1).Info("Conflict updating resource with owner reference, will retry",
+					"kind", obj.GetKind(),
+					"name", obj.GetName())
+			} else {
+				// Real errors should be logged
+				log.Error(err, "Failed to update resource with owner reference",
+					"kind", obj.GetKind(),
+					"name", obj.GetName())
+			}
 		} else {
 			log.Info("Set owner reference",
 				"kind", obj.GetKind(),
