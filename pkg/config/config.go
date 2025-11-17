@@ -24,7 +24,8 @@ type APIConfig struct {
 
 // ServerConfig holds server connection settings
 type ServerConfig struct {
-	URL string `yaml:"url"`
+	URL       string `yaml:"url"`
+	PublicURL string `yaml:"publicUrl,omitempty"`
 }
 
 // LoggingConfig holds logging settings
