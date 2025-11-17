@@ -120,7 +120,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 dev:
 	@echo "Starting development server..."
 	@if command -v air > /dev/null; then \
-		air -build.cmd 'make build' -build.bin $(BUILD_DIR)/$(BINARY_NAME) -build.args_bin '--config-path $(CONFIG_DIR)'; \
+		air -build.cmd 'make build' -build.bin $(BUILD_DIR)/$(BINARY_NAME) -build.args_bin '--config-path $(CONFIG_DIR) $(ARGS)' ; \
 	else \
 		echo "Air not found. Install with: go install github.com/air-verse/air@latest"; \
 		echo "Running without live reload..."; \

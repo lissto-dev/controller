@@ -15,8 +15,6 @@ repos:
     url: "https://github.com/example/repo"
     name: "Main Repository"
     branches: ["main", "master"]
-    tags:
-      prefix: "v"
 
 stacks:
   global:

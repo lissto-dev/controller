@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -40,15 +41,9 @@ type NamespacesConfig struct {
 
 // RepoConfig holds repository configuration
 type RepoConfig struct {
-	URL      string     `yaml:"url"`
-	Name     string     `yaml:"name,omitempty"`
-	Branches []string   `yaml:"branches"`
-	Tags     TagsConfig `yaml:"tags"`
-}
-
-// TagsConfig holds tag-related configuration
-type TagsConfig struct {
-	Prefix string `yaml:"prefix"`
+	URL      string   `yaml:"url"`
+	Name     string   `yaml:"name,omitempty"`
+	Branches []string `yaml:"branches"`
 }
 
 // StacksConfig holds stack configuration for ingress objects
@@ -125,9 +120,6 @@ func (c *Config) Validate() error {
 		if len(repo.Branches) == 0 {
 			return fmt.Errorf("repo %s: at least one branch must be configured", repoName)
 		}
-		if repo.Tags.Prefix == "" {
-			return fmt.Errorf("repo %s: tags.prefix is required", repoName)
-		}
 	}
 
 	// Validate Stacks
@@ -141,13 +133,71 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// IsGlobalBranch checks if a branch is configured as global for any repository
-func (c *Config) IsGlobalBranch(branch string) bool {
-	for _, repo := range c.Repos {
-		for _, repoBranch := range repo.Branches {
-			if repoBranch == branch {
-				return true
-			}
+// NormalizeRepositoryURL strips transport prefixes and normalizes repository URLs
+// Examples:
+//   - "https://github.com/lissto/lissto.git" -> "github.com/lissto/lissto"
+//   - "git@github.com:lissto/lissto.git" -> "github.com/lissto/lissto"
+//   - "github.com/lissto/lissto" -> "github.com/lissto/lissto"
+func NormalizeRepositoryURL(repoURL string) string {
+	normalized := strings.TrimSpace(repoURL)
+
+	// Remove common transport prefixes
+	normalized = strings.TrimPrefix(normalized, "https://")
+	normalized = strings.TrimPrefix(normalized, "http://")
+	normalized = strings.TrimPrefix(normalized, "git://")
+	normalized = strings.TrimPrefix(normalized, "ssh://")
+
+	// Handle git@github.com:org/repo format
+	if strings.HasPrefix(normalized, "git@") {
+		normalized = strings.TrimPrefix(normalized, "git@")
+		// Replace the colon with a slash: github.com:org/repo -> github.com/org/repo
+		normalized = strings.Replace(normalized, ":", "/", 1)
+	}
+
+	// Remove .git suffix
+	normalized = strings.TrimSuffix(normalized, ".git")
+
+	// Remove trailing slash
+	normalized = strings.TrimSuffix(normalized, "/")
+
+	return normalized
+}
+
+// ValidateRepository checks if a repository URL is configured
+// Returns the repo config key and true if found, empty string and false otherwise
+func (c *Config) ValidateRepository(repoURL string) (string, bool) {
+	if repoURL == "" {
+		return "", false
+	}
+
+	normalizedInput := NormalizeRepositoryURL(repoURL)
+
+	for repoKey, repo := range c.Repos {
+		normalizedConfigURL := NormalizeRepositoryURL(repo.URL)
+		if normalizedInput == normalizedConfigURL {
+			return repoKey, true
+		}
+	}
+
+	return "", false
+}
+
+// IsGlobalBranch checks if a branch is configured as global for a specific repository
+// Both repository and branch are required
+func (c *Config) IsGlobalBranch(repository, branch string) bool {
+	if repository == "" || branch == "" {
+		return false
+	}
+
+	repoKey, found := c.ValidateRepository(repository)
+	if !found {
+		return false
+	}
+
+	repo := c.Repos[repoKey]
+	for _, repoBranch := range repo.Branches {
+		if repoBranch == branch {
+			return true
 		}
 	}
 	return false
@@ -174,9 +224,6 @@ func DefaultConfig() *Config {
 				URL:      "https://github.com/example/repo",
 				Name:     "Main Repository",
 				Branches: []string{"main", "master"},
-				Tags: TagsConfig{
-					Prefix: "v",
-				},
 			},
 		},
 		Stacks: StacksConfig{

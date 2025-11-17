@@ -202,49 +202,45 @@ func (r *StackReconciler) applyResources(ctx context.Context, objects []*unstruc
 		// Ensure the namespace is set on the object
 		obj.SetNamespace(namespace)
 
-		// Try to get the resource first to see if it exists
-		existing := &unstructured.Unstructured{}
-		existing.SetGroupVersionKind(obj.GroupVersionKind())
-		err := r.Get(ctx, client.ObjectKeyFromObject(obj), existing)
+		// Special handling for PVCs - they are immutable after creation
+		if obj.GetKind() == "PersistentVolumeClaim" {
+			// Check if PVC already exists
+			existing := &unstructured.Unstructured{}
+			existing.SetGroupVersionKind(obj.GroupVersionKind())
+			err := r.Get(ctx, client.ObjectKeyFromObject(obj), existing)
 
-		if err != nil {
-			// Resource doesn't exist, create it
-			if err := r.Create(ctx, obj); err != nil {
-				log.Error(err, "Failed to create resource",
+			if err != nil {
+				// PVC doesn't exist, create it
+				if err := r.Create(ctx, obj); err != nil {
+					log.Error(err, "Failed to create PVC",
+						"name", obj.GetName())
+					result.Applied = false
+					result.Error = err
+				} else {
+					log.Info("Created PVC",
+						"name", obj.GetName())
+					result.Applied = true
+				}
+			} else {
+				// PVC exists, skip update (immutable)
+				log.Info("PVC already exists, skipping update (immutable)",
+					"name", obj.GetName())
+				result.Applied = true
+			}
+		} else {
+			// For other resources, use server-side apply with proper field management
+			// This allows proper updates and field ownership tracking
+			if err := r.Patch(ctx, obj, client.Apply, client.ForceOwnership, client.FieldOwner("stack-controller")); err != nil {
+				log.Error(err, "Failed to apply resource",
 					"kind", obj.GetKind(),
 					"name", obj.GetName())
 				result.Applied = false
 				result.Error = err
 			} else {
-				log.Info("Created resource",
+				log.Info("Applied resource",
 					"kind", obj.GetKind(),
 					"name", obj.GetName())
 				result.Applied = true
-			}
-		} else {
-			// Resource exists, check if it's a PVC (special handling)
-			if obj.GetKind() == "PersistentVolumeClaim" {
-				// PVCs can't be updated after creation except for resources.requests
-				// Skip update for PVCs to avoid immutable field errors
-				log.Info("Skipping PVC update (immutable after creation)",
-					"kind", obj.GetKind(),
-					"name", obj.GetName())
-				result.Applied = true // Consider it successful since it exists
-			} else {
-				// For other resources, update normally
-				obj.SetResourceVersion(existing.GetResourceVersion())
-				if err := r.Update(ctx, obj); err != nil {
-					log.Error(err, "Failed to update resource",
-						"kind", obj.GetKind(),
-						"name", obj.GetName())
-					result.Applied = false
-					result.Error = err
-				} else {
-					log.Info("Updated resource",
-						"kind", obj.GetKind(),
-						"name", obj.GetName())
-					result.Applied = true
-				}
 			}
 		}
 
