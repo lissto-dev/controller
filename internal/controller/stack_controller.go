@@ -81,7 +81,7 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	manifests, err := r.fetchManifests(ctx, stack.Namespace, configMapName)
 	if err != nil {
 		log.Error(err, "Failed to fetch manifests from ConfigMap")
-		r.updateStackStatus(ctx, stack, nil, fmt.Errorf("failed to fetch manifests: %w", err))
+		r.updateStackStatus(ctx, stack, nil, nil, fmt.Errorf("failed to fetch manifests: %w", err))
 		return ctrl.Result{}, err
 	}
 
@@ -89,14 +89,14 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	objects, err := parseManifests(manifests)
 	if err != nil {
 		log.Error(err, "Failed to parse manifests")
-		r.updateStackStatus(ctx, stack, nil, fmt.Errorf("failed to parse manifests: %w", err))
+		r.updateStackStatus(ctx, stack, nil, nil, fmt.Errorf("failed to parse manifests: %w", err))
 		return ctrl.Result{}, err
 	}
 
 	log.Info("Parsed manifests", "count", len(objects))
 
 	// Inject images from Stack spec into deployments
-	r.injectImages(ctx, objects, stack.Spec.Images)
+	imageWarnings := r.injectImages(ctx, objects, stack.Spec.Images)
 
 	// Apply all resources
 	results := r.applyResources(ctx, objects, stack.Namespace)
@@ -105,7 +105,7 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	r.setOwnerReferences(ctx, stack, objects, results)
 
 	// Update Stack status with results
-	r.updateStackStatus(ctx, stack, results, nil)
+	r.updateStackStatus(ctx, stack, results, imageWarnings, nil)
 
 	log.Info("Stack reconciliation complete", "name", stack.Name)
 	return ctrl.Result{}, nil
@@ -117,6 +117,14 @@ type ResourceResult struct {
 	Name    string
 	Applied bool
 	Error   error
+}
+
+// ImageWarning tracks image injection issues
+type ImageWarning struct {
+	Service         string
+	Deployment      string
+	TargetContainer string
+	Message         string
 }
 
 // fetchManifests retrieves manifests from ConfigMap
@@ -138,8 +146,9 @@ func (r *StackReconciler) fetchManifests(ctx context.Context, namespace, configM
 }
 
 // injectImages updates deployment container images from Stack spec
-func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructured.Unstructured, images map[string]envv1alpha1.ImageInfo) {
+func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructured.Unstructured, images map[string]envv1alpha1.ImageInfo) []ImageWarning {
 	log := logf.FromContext(ctx)
+	var warnings []ImageWarning
 
 	for _, obj := range objects {
 		// Only process Deployments
@@ -149,14 +158,53 @@ func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructu
 
 		deploymentName := obj.GetName()
 
-		// Get the containers array from spec.template.spec.containers
-		containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
-		if err != nil || !found {
-			log.Error(err, "Failed to get containers from Deployment", "name", deploymentName)
+		// Get the service name from the deployment's labels
+		// The service name is stored in the "io.kompose.service" label
+		labels := obj.GetLabels()
+		serviceName, ok := labels["io.kompose.service"]
+		if !ok {
+			log.V(1).Info("Deployment missing io.kompose.service label, skipping image injection",
+				"deployment", deploymentName)
+			warnings = append(warnings, ImageWarning{
+				Deployment: deploymentName,
+				Message:    "Deployment missing io.kompose.service label",
+			})
 			continue
 		}
 
-		// Update each container's image if we have it in stack.Spec.Images
+		// Look up image by service name
+		imageInfo, exists := images[serviceName]
+		if !exists {
+			log.V(1).Info("No image found for service",
+				"deployment", deploymentName,
+				"service", serviceName)
+			warnings = append(warnings, ImageWarning{
+				Service:    serviceName,
+				Deployment: deploymentName,
+				Message:    "No image specification found for service",
+			})
+			continue
+		}
+
+		// Get main containers (not init containers)
+		containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+		if err != nil || !found {
+			log.Error(err, "Failed to get containers", "deployment", deploymentName)
+			warnings = append(warnings, ImageWarning{
+				Service:    serviceName,
+				Deployment: deploymentName,
+				Message:    fmt.Sprintf("Failed to get containers: %v", err),
+			})
+			continue
+		}
+
+		// Determine target container name
+		targetContainerName := imageInfo.ContainerName
+		if targetContainerName == "" {
+			targetContainerName = serviceName // Default to service name
+		}
+
+		// Update matching containers
 		updated := false
 		for i, container := range containers {
 			containerMap, ok := container.(map[string]interface{})
@@ -166,27 +214,47 @@ func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructu
 
 			containerName, _, _ := unstructured.NestedString(containerMap, "name")
 
-			// Check if we have an image for this service/container
-			if imageInfo, exists := images[containerName]; exists {
-				// Use the digest from Stack spec
+			// Match by target container name
+			if containerName == targetContainerName {
 				containerMap["image"] = imageInfo.Digest
 				containers[i] = containerMap
 				updated = true
 
 				log.Info("Injected image into Deployment",
 					"deployment", deploymentName,
+					"service", serviceName,
 					"container", containerName,
 					"image", imageInfo.Digest)
 			}
 		}
 
-		// Write back the updated containers
+		if !updated {
+			log.Info("No matching container found for image injection",
+				"deployment", deploymentName,
+				"service", serviceName,
+				"targetContainer", targetContainerName)
+			warnings = append(warnings, ImageWarning{
+				Service:         serviceName,
+				Deployment:      deploymentName,
+				TargetContainer: targetContainerName,
+				Message:         fmt.Sprintf("No container named '%s' found in deployment", targetContainerName),
+			})
+		}
+
+		// Write back updated containers
 		if updated {
 			if err := unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers"); err != nil {
-				log.Error(err, "Failed to set containers in Deployment", "name", deploymentName)
+				log.Error(err, "Failed to set containers", "deployment", deploymentName)
+				warnings = append(warnings, ImageWarning{
+					Service:    serviceName,
+					Deployment: deploymentName,
+					Message:    fmt.Sprintf("Failed to update containers: %v", err),
+				})
 			}
 		}
 	}
+
+	return warnings
 }
 
 // applyResources applies all resources to cluster using server-side apply
@@ -315,7 +383,7 @@ func (r *StackReconciler) setOwnerReferences(ctx context.Context, stack *envv1al
 
 // updateStackStatus updates Stack conditions based on resource application results
 func (r *StackReconciler) updateStackStatus(ctx context.Context, stack *envv1alpha1.Stack,
-	results []ResourceResult, parseError error) {
+	results []ResourceResult, imageWarnings []ImageWarning, parseError error) {
 	log := logf.FromContext(ctx)
 
 	conditions := []metav1.Condition{}
@@ -338,6 +406,40 @@ func (r *StackReconciler) updateStackStatus(ctx context.Context, stack *envv1alp
 			log.Error(err, "Failed to update Stack status")
 		}
 		return
+	}
+
+	// Handle image injection warnings
+	if len(imageWarnings) > 0 {
+		// Create warning messages
+		warningMessages := make([]string, 0, len(imageWarnings))
+		for _, warning := range imageWarnings {
+			if warning.Service != "" {
+				warningMessages = append(warningMessages,
+					fmt.Sprintf("Service '%s' (deployment '%s'): %s", warning.Service, warning.Deployment, warning.Message))
+			} else {
+				warningMessages = append(warningMessages,
+					fmt.Sprintf("Deployment '%s': %s", warning.Deployment, warning.Message))
+			}
+		}
+
+		conditions = append(conditions, metav1.Condition{
+			Type:               "ImageInjection",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: stack.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "ImageInjectionWarning",
+			Message:            strings.Join(warningMessages, "; "),
+		})
+	} else {
+		// All images injected successfully
+		conditions = append(conditions, metav1.Condition{
+			Type:               "ImageInjection",
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: stack.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "AllImagesInjected",
+			Message:            "All service images injected successfully",
+		})
 	}
 
 	// Track resource conditions

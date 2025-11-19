@@ -36,15 +36,15 @@ type ImageInfo struct {
 	// URL is the exposed service URL (if the service is exposed)
 	// +optional
 	URL string `json:"url,omitempty"`
+
+	// ContainerName is the custom container name if specified in docker-compose
+	// If empty, defaults to service name for matching
+	// +optional
+	ContainerName string `json:"containerName,omitempty"`
 }
 
 // StackSpec defines the desired state of Stack
 type StackSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
-
 	// BlueprintReference references the Blueprint resource
 	// This field is immutable after creation
 	// +required
