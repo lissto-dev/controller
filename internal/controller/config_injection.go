@@ -29,12 +29,14 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
+	"github.com/lissto-dev/controller/pkg/util"
 )
 
 // ConfigInjectionResult tracks the result of config injection
 type ConfigInjectionResult struct {
 	VariablesInjected int
 	SecretsInjected   int
+	MissingSecretKeys map[string][]string // secretRef -> missing keys
 	Warnings          []string
 }
 
@@ -179,11 +181,11 @@ func matchesStack(v *envv1alpha1.LisstoVariable, stack *envv1alpha1.Stack, repos
 		// Global scope matches all stacks
 		return true
 	case "repo":
-		// Repo scope matches if repository matches
-		return repository != "" && v.Spec.Repository == repository
+		// Repo scope matches if both repository and spec.Repository are non-empty and equal
+		return repository != "" && v.Spec.Repository != "" && v.Spec.Repository == repository
 	case "env":
-		// Env scope matches if env matches
-		return stack.Spec.Env != "" && v.Spec.Env == stack.Spec.Env
+		// Env scope matches if both env fields are non-empty and equal
+		return stack.Spec.Env != "" && v.Spec.Env != "" && v.Spec.Env == stack.Spec.Env
 	default:
 		return false
 	}
@@ -197,9 +199,11 @@ func matchesStackSecret(s *envv1alpha1.LisstoSecret, stack *envv1alpha1.Stack, r
 	case "global":
 		return true
 	case "repo":
-		return repository != "" && s.Spec.Repository == repository
+		// Repo scope matches if both repository and spec.Repository are non-empty and equal
+		return repository != "" && s.Spec.Repository != "" && s.Spec.Repository == repository
 	case "env":
-		return stack.Spec.Env != "" && s.Spec.Env == stack.Spec.Env
+		// Env scope matches if both env fields are non-empty and equal
+		return stack.Spec.Env != "" && s.Spec.Env != "" && s.Spec.Env == stack.Spec.Env
 	default:
 		return false
 	}
@@ -271,11 +275,12 @@ func (r *StackReconciler) resolveSecretKeys(secrets []envv1alpha1.LisstoSecret) 
 
 // copySecretsToStackNamespace copies secret values from source secrets to a merged secret in stack namespace
 // Optimized: batches K8s Secret reads by grouping keys by source secret
-func (r *StackReconciler) copySecretsToStackNamespace(ctx context.Context, stack *envv1alpha1.Stack, resolvedKeys map[string]secretKeySource) (*corev1.Secret, error) {
+// Returns: created/updated secret, map of missing keys per secretRef, error
+func (r *StackReconciler) copySecretsToStackNamespace(ctx context.Context, stack *envv1alpha1.Stack, resolvedKeys map[string]secretKeySource) (*corev1.Secret, map[string][]string, error) {
 	log := logf.FromContext(ctx)
 
 	if len(resolvedKeys) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Group keys by source secret to minimize API calls
@@ -302,6 +307,8 @@ func (r *StackReconciler) copySecretsToStackNamespace(ctx context.Context, stack
 
 	// Read each unique source secret once and extract all needed keys
 	mergedData := make(map[string][]byte)
+	missingKeys := make(map[string][]string) // secretRef -> missing keys
+
 	for _, source := range sourceMap {
 		k8sSecret := &corev1.Secret{}
 		if err := r.Get(ctx, client.ObjectKey{
@@ -311,23 +318,38 @@ func (r *StackReconciler) copySecretsToStackNamespace(ctx context.Context, stack
 			log.Error(err, "Failed to read source secret",
 				"namespace", source.namespace,
 				"name", source.secretRef)
+			// Track all keys as missing for this secret
+			missingKeys[source.secretRef] = source.keys
 			continue
 		}
 
 		// Copy all needed keys from this secret
+		missing := []string{}
 		for _, keyName := range source.keys {
 			if value, exists := k8sSecret.Data[keyName]; exists {
 				mergedData[keyName] = value
+			} else {
+				missing = append(missing, keyName)
 			}
+		}
+
+		// Track missing keys
+		if len(missing) > 0 {
+			missingKeys[source.secretRef] = missing
+			log.Error(nil, "Secret keys declared but not found in K8s Secret",
+				"namespace", source.namespace,
+				"secret", source.secretRef,
+				"missingKeys", missing)
 		}
 	}
 
 	log.V(1).Info("Read source secrets",
 		"uniqueSources", len(sourceMap),
-		"totalKeys", len(resolvedKeys))
+		"totalKeys", len(resolvedKeys),
+		"missingKeys", len(missingKeys))
 
 	if len(mergedData) == 0 {
-		return nil, nil
+		return nil, missingKeys, nil
 	}
 
 	// Create or update the stack's merged secret
@@ -345,9 +367,11 @@ func (r *StackReconciler) copySecretsToStackNamespace(ctx context.Context, stack
 		Data: mergedData,
 	}
 
-	// Set owner reference so it's cleaned up with the stack
+	// Set owner reference for automatic cleanup (best effort)
+	// If this fails, the Stack finalizer will handle cleanup
 	if err := controllerutil.SetControllerReference(stack, stackSecret, r.Scheme); err != nil {
-		log.Error(err, "Failed to set owner reference on stack secret")
+		log.Error(err, "Failed to set owner reference, will rely on finalizer for cleanup",
+			"secret", stackSecretName)
 	}
 
 	// Create or update
@@ -356,20 +380,20 @@ func (r *StackReconciler) copySecretsToStackNamespace(ctx context.Context, stack
 	if err != nil {
 		// Create new
 		if err := r.Create(ctx, stackSecret); err != nil {
-			return nil, fmt.Errorf("failed to create stack secret: %w", err)
+			return nil, missingKeys, fmt.Errorf("failed to create stack secret: %w", err)
 		}
 		log.Info("Created stack config secret", "name", stackSecretName, "keys", len(mergedData))
 	} else {
 		// Update existing
 		existing.Data = mergedData
 		if err := r.Update(ctx, existing); err != nil {
-			return nil, fmt.Errorf("failed to update stack secret: %w", err)
+			return nil, missingKeys, fmt.Errorf("failed to update stack secret: %w", err)
 		}
 		log.Info("Updated stack config secret", "name", stackSecretName, "keys", len(mergedData))
 		stackSecret = existing
 	}
 
-	return stackSecret, nil
+	return stackSecret, missingKeys, nil
 }
 
 // injectConfigIntoDeployments injects environment variables and secret refs into deployments
@@ -458,22 +482,12 @@ func (r *StackReconciler) injectConfigIntoDeployments(ctx context.Context, objec
 
 // getBlueprint fetches the blueprint referenced by the stack
 func (r *StackReconciler) getBlueprint(ctx context.Context, stack *envv1alpha1.Stack) (*envv1alpha1.Blueprint, error) {
-	// Parse blueprint reference (format: namespace/name or just name)
-	ref := stack.Spec.BlueprintReference
-	namespace := stack.Namespace
-	name := ref
-
-	for i, ch := range ref {
-		if ch == '/' {
-			// Parse scope/name format
-			scope := ref[:i]
-			name = ref[i+1:]
-			if scope == "global" {
-				namespace = r.Config.Namespaces.Global
-			}
-			break
-		}
-	}
+	// Parse blueprint reference using shared utility
+	namespace, name := util.ParseBlueprintReference(
+		stack.Spec.BlueprintReference,
+		stack.Namespace,
+		r.Config.Namespaces.Global,
+	)
 
 	blueprint := &envv1alpha1.Blueprint{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, blueprint); err != nil {

@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -35,11 +36,16 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
+const (
+	stackFinalizerName = "stack.lissto.dev/config-cleanup"
+)
+
 // StackReconciler reconciles a Stack object
 type StackReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Config *config.Config
+	Scheme   *runtime.Scheme
+	Config   *config.Config
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=stacks,verbs=get;list;watch;create;update;patch;delete
@@ -50,6 +56,7 @@ type StackReconciler struct {
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=blueprints,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
@@ -75,6 +82,37 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 	log.Info("Reconciling Stack", "name", stack.Name, "namespace", stack.Namespace)
 
+	// Handle finalizer for cleanup
+	if stack.ObjectMeta.DeletionTimestamp.IsZero() {
+		// Stack is not being deleted, ensure finalizer is present
+		if !controllerutil.ContainsFinalizer(stack, stackFinalizerName) {
+			controllerutil.AddFinalizer(stack, stackFinalizerName)
+			if err := r.Update(ctx, stack); err != nil {
+				log.Error(err, "Failed to add finalizer")
+				return ctrl.Result{}, err
+			}
+			log.Info("Added finalizer to Stack")
+		}
+	} else {
+		// Stack is being deleted, run cleanup
+		if controllerutil.ContainsFinalizer(stack, stackFinalizerName) {
+			if err := r.cleanupConfigSecrets(ctx, stack); err != nil {
+				log.Error(err, "Failed to cleanup config secrets")
+				return ctrl.Result{}, err
+			}
+
+			// Remove finalizer
+			controllerutil.RemoveFinalizer(stack, stackFinalizerName)
+			if err := r.Update(ctx, stack); err != nil {
+				log.Error(err, "Failed to remove finalizer")
+				return ctrl.Result{}, err
+			}
+			log.Info("Removed finalizer from Stack")
+		}
+		// Stop reconciliation as the Stack is being deleted
+		return ctrl.Result{}, nil
+	}
+
 	// Fetch manifests from ConfigMap
 	configMapName := stack.Spec.ManifestsConfigMapRef
 	if configMapName == "" {
@@ -85,7 +123,7 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	manifests, err := r.fetchManifests(ctx, stack.Namespace, configMapName)
 	if err != nil {
 		log.Error(err, "Failed to fetch manifests from ConfigMap")
-		r.updateStackStatus(ctx, stack, nil, nil, fmt.Errorf("failed to fetch manifests: %w", err))
+		r.updateStackStatus(ctx, stack, nil, nil, nil, fmt.Errorf("failed to fetch manifests: %w", err))
 		return ctrl.Result{}, err
 	}
 
@@ -93,7 +131,7 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	objects, err := parseManifests(manifests)
 	if err != nil {
 		log.Error(err, "Failed to parse manifests")
-		r.updateStackStatus(ctx, stack, nil, nil, fmt.Errorf("failed to parse manifests: %w", err))
+		r.updateStackStatus(ctx, stack, nil, nil, nil, fmt.Errorf("failed to parse manifests: %w", err))
 		return ctrl.Result{}, err
 	}
 
@@ -117,21 +155,34 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 		// Copy secrets to stack namespace
 		stackSecretName := ""
+		var missingSecretKeys map[string][]string
 		if len(resolvedKeys) > 0 {
-			stackSecret, err := r.copySecretsToStackNamespace(ctx, stack, resolvedKeys)
+			stackSecret, missing, err := r.copySecretsToStackNamespace(ctx, stack, resolvedKeys)
+			missingSecretKeys = missing
 			if err != nil {
 				log.Error(err, "Failed to copy secrets to stack namespace")
 			} else if stackSecret != nil {
 				stackSecretName = stackSecret.Name
+			}
+
+			// Emit events for missing keys
+			if len(missingSecretKeys) > 0 {
+				for secretRef, keys := range missingSecretKeys {
+					r.Recorder.Eventf(stack, corev1.EventTypeWarning, "MissingSecretKeys",
+						"Secret %s is missing keys: %v", secretRef, keys)
+				}
 			}
 		}
 
 		// Inject config into deployments
 		configResult = r.injectConfigIntoDeployments(ctx, objects, mergedVars, resolvedKeys, stackSecretName)
 		if configResult != nil {
+			configResult.MissingSecretKeys = missingSecretKeys
+
 			log.Info("Config injection complete",
 				"variables", configResult.VariablesInjected,
-				"secrets", configResult.SecretsInjected)
+				"secrets", configResult.SecretsInjected,
+				"missingKeys", len(missingSecretKeys))
 		}
 	}
 
@@ -145,7 +196,7 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	r.setOwnerReferences(ctx, stack, objects, results)
 
 	// Update Stack status with results
-	r.updateStackStatus(ctx, stack, results, imageWarnings, nil)
+	r.updateStackStatus(ctx, stack, results, imageWarnings, configResult, nil)
 
 	log.Info("Stack reconciliation complete", "name", stack.Name)
 	return ctrl.Result{}, nil
@@ -423,7 +474,7 @@ func (r *StackReconciler) setOwnerReferences(ctx context.Context, stack *envv1al
 
 // updateStackStatus updates Stack conditions based on resource application results
 func (r *StackReconciler) updateStackStatus(ctx context.Context, stack *envv1alpha1.Stack,
-	results []ResourceResult, imageWarnings []ImageWarning, parseError error) {
+	results []ResourceResult, imageWarnings []ImageWarning, configResult *ConfigInjectionResult, parseError error) {
 	log := logf.FromContext(ctx)
 
 	conditions := []metav1.Condition{}
@@ -482,6 +533,38 @@ func (r *StackReconciler) updateStackStatus(ctx context.Context, stack *envv1alp
 		})
 	}
 
+	// Handle config injection result
+	if configResult != nil {
+		if len(configResult.MissingSecretKeys) > 0 {
+			// Build warning message for missing keys
+			missingMsg := "Missing secret keys: "
+			keyMsgs := []string{}
+			for secretRef, keys := range configResult.MissingSecretKeys {
+				keyMsgs = append(keyMsgs, fmt.Sprintf("%s[%v]", secretRef, keys))
+			}
+			missingMsg += strings.Join(keyMsgs, ", ")
+
+			conditions = append(conditions, metav1.Condition{
+				Type:               "ConfigInjection",
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: stack.Generation,
+				LastTransitionTime: metav1.Now(),
+				Reason:             "MissingSecretKeys",
+				Message:            missingMsg,
+			})
+		} else if configResult.VariablesInjected > 0 || configResult.SecretsInjected > 0 {
+			// Config injected successfully
+			conditions = append(conditions, metav1.Condition{
+				Type:               "ConfigInjection",
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: stack.Generation,
+				LastTransitionTime: metav1.Now(),
+				Reason:             "ConfigInjected",
+				Message:            fmt.Sprintf("Injected %d variables and %d secrets", configResult.VariablesInjected, configResult.SecretsInjected),
+			})
+		}
+	}
+
 	// Track resource conditions
 	hasFailures := false
 	for _, result := range results {
@@ -536,6 +619,36 @@ func (r *StackReconciler) updateStackStatus(ctx context.Context, stack *envv1alp
 	if err := r.Status().Update(ctx, stack); err != nil {
 		log.Error(err, "Failed to update Stack status")
 	}
+}
+
+// cleanupConfigSecrets cleans up orphaned config secrets that may not have owner references
+func (r *StackReconciler) cleanupConfigSecrets(ctx context.Context, stack *envv1alpha1.Stack) error {
+	log := logf.FromContext(ctx)
+
+	// Find all secrets with our managed-by label
+	secretList := &corev1.SecretList{}
+	if err := r.List(ctx, secretList,
+		client.InNamespace(stack.Namespace),
+		client.MatchingLabels{
+			"lissto.dev/managed-by": "stack-controller",
+			"lissto.dev/stack":      stack.Name,
+		}); err != nil {
+		return fmt.Errorf("failed to list managed secrets: %w", err)
+	}
+
+	// Delete all managed secrets for this stack
+	for i := range secretList.Items {
+		secret := &secretList.Items[i]
+		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "Failed to delete config secret", "secret", secret.Name)
+			// Continue trying to delete others
+		} else {
+			log.Info("Deleted config secret", "secret", secret.Name)
+		}
+	}
+
+	log.Info("Cleaned up config secrets", "count", len(secretList.Items))
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
