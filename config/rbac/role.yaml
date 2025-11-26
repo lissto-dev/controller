@@ -16,6 +16,7 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
+  - secrets
   - services
   verbs:
   - create
@@ -71,6 +72,15 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - env.lissto.dev
+  resources:
+  - lisstosecrets
+  - lisstovariables
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - networking.k8s.io
   resources:

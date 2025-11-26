@@ -45,7 +45,11 @@ type StackReconciler struct {
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=stacks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=stacks/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=stacks/finalizers,verbs=update
+// +kubebuilder:rbac:groups=env.lissto.dev,resources=lisstovariables,verbs=get;list;watch
+// +kubebuilder:rbac:groups=env.lissto.dev,resources=lisstosecrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=env.lissto.dev,resources=blueprints,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
@@ -94,6 +98,42 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	log.Info("Parsed manifests", "count", len(objects))
+
+	// Fetch blueprint for config discovery
+	blueprint, err := r.getBlueprint(ctx, stack)
+	if err != nil {
+		log.Error(err, "Failed to fetch blueprint for config discovery")
+		// Continue without config injection - not fatal
+	}
+
+	// Discover and inject config (variables and secrets)
+	var configResult *ConfigInjectionResult
+	if blueprint != nil {
+		variables, _ := r.discoverVariables(ctx, stack, blueprint)
+		secrets, _ := r.discoverSecrets(ctx, stack, blueprint)
+
+		mergedVars := r.resolveVariables(variables)
+		resolvedKeys := r.resolveSecretKeys(secrets)
+
+		// Copy secrets to stack namespace
+		stackSecretName := ""
+		if len(resolvedKeys) > 0 {
+			stackSecret, err := r.copySecretsToStackNamespace(ctx, stack, resolvedKeys)
+			if err != nil {
+				log.Error(err, "Failed to copy secrets to stack namespace")
+			} else if stackSecret != nil {
+				stackSecretName = stackSecret.Name
+			}
+		}
+
+		// Inject config into deployments
+		configResult = r.injectConfigIntoDeployments(ctx, objects, mergedVars, resolvedKeys, stackSecretName)
+		if configResult != nil {
+			log.Info("Config injection complete",
+				"variables", configResult.VariablesInjected,
+				"secrets", configResult.SecretsInjected)
+		}
+	}
 
 	// Inject images from Stack spec into deployments
 	imageWarnings := r.injectImages(ctx, objects, stack.Spec.Images)
