@@ -15,7 +15,26 @@ env:
   IMAGE_NAME: lissto/controller
 
 jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run Tests
+        run: |
+          go mod tidy
+          make test
+
   build-and-push:
+    name: Build and Push Docker Image
+    needs: test  # Tests must pass before building/pushing
     runs-on: ubuntu-latest
     permissions:
       contents: read
