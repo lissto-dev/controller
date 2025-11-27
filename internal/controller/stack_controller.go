@@ -174,8 +174,8 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			}
 		}
 
-		// Inject config into deployments
-		configResult = r.injectConfigIntoDeployments(ctx, objects, mergedVars, resolvedKeys, stackSecretName)
+		// Inject config into workloads (deployments and pods)
+		configResult = r.injectConfigIntoWorkloads(ctx, objects, mergedVars, resolvedKeys, stackSecretName)
 		if configResult != nil {
 			configResult.MissingSecretKeys = missingSecretKeys
 
@@ -236,29 +236,39 @@ func (r *StackReconciler) fetchManifests(ctx context.Context, namespace, configM
 	return manifests, nil
 }
 
-// injectImages updates deployment container images from Stack spec
+// injectImages updates deployment and pod container images from Stack spec
 func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructured.Unstructured, images map[string]envv1alpha1.ImageInfo) []ImageWarning {
 	log := logf.FromContext(ctx)
 	var warnings []ImageWarning
 
 	for _, obj := range objects {
-		// Only process Deployments
-		if obj.GetKind() != "Deployment" {
+		// Support both Deployment and Pod
+		if obj.GetKind() != "Deployment" && obj.GetKind() != "Pod" {
 			continue
 		}
 
-		deploymentName := obj.GetName()
+		resourceKind := obj.GetKind()
+		resourceName := obj.GetName()
 
-		// Get the service name from the deployment's labels
+		// Get containers path based on resource type
+		var containersPath []string
+		if resourceKind == "Deployment" {
+			containersPath = []string{"spec", "template", "spec", "containers"}
+		} else { // Pod
+			containersPath = []string{"spec", "containers"}
+		}
+
+		// Get the service name from the resource's labels
 		// The service name is stored in the "io.kompose.service" label
 		labels := obj.GetLabels()
 		serviceName, ok := labels["io.kompose.service"]
 		if !ok {
-			log.V(1).Info("Deployment missing io.kompose.service label, skipping image injection",
-				"deployment", deploymentName)
+			log.V(1).Info("Resource missing io.kompose.service label, skipping image injection",
+				"kind", resourceKind,
+				"name", resourceName)
 			warnings = append(warnings, ImageWarning{
-				Deployment: deploymentName,
-				Message:    "Deployment missing io.kompose.service label",
+				Deployment: resourceName,
+				Message:    fmt.Sprintf("%s missing io.kompose.service label", resourceKind),
 			})
 			continue
 		}
@@ -267,23 +277,26 @@ func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructu
 		imageInfo, exists := images[serviceName]
 		if !exists {
 			log.V(1).Info("No image found for service",
-				"deployment", deploymentName,
+				"kind", resourceKind,
+				"name", resourceName,
 				"service", serviceName)
 			warnings = append(warnings, ImageWarning{
 				Service:    serviceName,
-				Deployment: deploymentName,
+				Deployment: resourceName,
 				Message:    "No image specification found for service",
 			})
 			continue
 		}
 
 		// Get main containers (not init containers)
-		containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+		containers, found, err := unstructured.NestedSlice(obj.Object, containersPath...)
 		if err != nil || !found {
-			log.Error(err, "Failed to get containers", "deployment", deploymentName)
+			log.Error(err, "Failed to get containers",
+				"kind", resourceKind,
+				"name", resourceName)
 			warnings = append(warnings, ImageWarning{
 				Service:    serviceName,
-				Deployment: deploymentName,
+				Deployment: resourceName,
 				Message:    fmt.Sprintf("Failed to get containers: %v", err),
 			})
 			continue
@@ -311,8 +324,9 @@ func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructu
 				containers[i] = containerMap
 				updated = true
 
-				log.Info("Injected image into Deployment",
-					"deployment", deploymentName,
+				log.Info("Injected image",
+					"kind", resourceKind,
+					"name", resourceName,
 					"service", serviceName,
 					"container", containerName,
 					"image", imageInfo.Digest)
@@ -321,24 +335,27 @@ func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructu
 
 		if !updated {
 			log.Info("No matching container found for image injection",
-				"deployment", deploymentName,
+				"kind", resourceKind,
+				"name", resourceName,
 				"service", serviceName,
 				"targetContainer", targetContainerName)
 			warnings = append(warnings, ImageWarning{
 				Service:         serviceName,
-				Deployment:      deploymentName,
+				Deployment:      resourceName,
 				TargetContainer: targetContainerName,
-				Message:         fmt.Sprintf("No container named '%s' found in deployment", targetContainerName),
+				Message:         fmt.Sprintf("No container named '%s' found in %s", targetContainerName, resourceKind),
 			})
 		}
 
 		// Write back updated containers
 		if updated {
-			if err := unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers"); err != nil {
-				log.Error(err, "Failed to set containers", "deployment", deploymentName)
+			if err := unstructured.SetNestedSlice(obj.Object, containers, containersPath...); err != nil {
+				log.Error(err, "Failed to set containers",
+					"kind", resourceKind,
+					"name", resourceName)
 				warnings = append(warnings, ImageWarning{
 					Service:    serviceName,
-					Deployment: deploymentName,
+					Deployment: resourceName,
 					Message:    fmt.Sprintf("Failed to update containers: %v", err),
 				})
 			}

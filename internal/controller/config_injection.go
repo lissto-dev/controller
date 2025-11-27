@@ -397,7 +397,7 @@ func (r *StackReconciler) copySecretsToStackNamespace(ctx context.Context, stack
 }
 
 // injectConfigIntoDeployments injects environment variables and secret refs into deployments
-func (r *StackReconciler) injectConfigIntoDeployments(ctx context.Context, objects []*unstructured.Unstructured,
+func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects []*unstructured.Unstructured,
 	mergedVars map[string]string, resolvedKeys map[string]secretKeySource, stackSecretName string) *ConfigInjectionResult {
 	log := logf.FromContext(ctx)
 	result := &ConfigInjectionResult{}
@@ -407,17 +407,27 @@ func (r *StackReconciler) injectConfigIntoDeployments(ctx context.Context, objec
 	}
 
 	for _, obj := range objects {
-		if obj.GetKind() != "Deployment" {
+		// Support both Deployment and Pod
+		if obj.GetKind() != "Deployment" && obj.GetKind() != "Pod" {
 			continue
 		}
 
-		deploymentName := obj.GetName()
+		resourceKind := obj.GetKind()
+		resourceName := obj.GetName()
+
+		// Get containers path based on resource type
+		var containersPath []string
+		if resourceKind == "Deployment" {
+			containersPath = []string{"spec", "template", "spec", "containers"}
+		} else { // Pod
+			containersPath = []string{"spec", "containers"}
+		}
 
 		// Get containers
-		containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+		containers, found, err := unstructured.NestedSlice(obj.Object, containersPath...)
 		if err != nil || !found {
 			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("Failed to get containers from deployment %s", deploymentName))
+				fmt.Sprintf("Failed to get containers from %s %s", resourceKind, resourceName))
 			continue
 		}
 
@@ -434,19 +444,57 @@ func (r *StackReconciler) injectConfigIntoDeployments(ctx context.Context, objec
 				existingEnv = []interface{}{}
 			}
 
-			// Add merged variables
+			// Build hierarchy: secrets > variables > compose
+			// Secrets have highest priority, so track which keys are secrets
+			secretKeys := make(map[string]bool)
+			for key := range resolvedKeys {
+				secretKeys[key] = true
+			}
+
+			// Build set of all keys that will be injected
+			keysToInject := make(map[string]bool)
+			for key := range mergedVars {
+				keysToInject[key] = true
+			}
+			for key := range resolvedKeys {
+				keysToInject[key] = true
+			}
+
+			// Filter out existing env vars that conflict with injected ones
+			// This allows LisstoVariables/Secrets to override compose values
+			filteredEnv := []interface{}{}
+			for _, envVar := range existingEnv {
+				envMap, ok := envVar.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				name, ok := envMap["name"].(string)
+				if !ok {
+					continue
+				}
+				// Keep only env vars that won't conflict
+				if !keysToInject[name] {
+					filteredEnv = append(filteredEnv, envVar)
+				}
+			}
+
+			// Add merged variables (these override compose values, but NOT secrets)
 			for key, value := range mergedVars {
-				existingEnv = append(existingEnv, map[string]interface{}{
+				// Skip if this key is also a secret (secrets have higher priority)
+				if secretKeys[key] {
+					continue
+				}
+				filteredEnv = append(filteredEnv, map[string]interface{}{
 					"name":  key,
 					"value": value,
 				})
 				result.VariablesInjected++
 			}
 
-			// Add secret key refs
+			// Add secret key refs (these override both compose and variables)
 			if stackSecretName != "" {
 				for key := range resolvedKeys {
-					existingEnv = append(existingEnv, map[string]interface{}{
+					filteredEnv = append(filteredEnv, map[string]interface{}{
 						"name": key,
 						"valueFrom": map[string]interface{}{
 							"secretKeyRef": map[string]interface{}{
@@ -460,18 +508,21 @@ func (r *StackReconciler) injectConfigIntoDeployments(ctx context.Context, objec
 			}
 
 			// Update container env
-			containerMap["env"] = existingEnv
+			containerMap["env"] = filteredEnv
 			containers[i] = containerMap
 		}
 
 		// Write back containers
-		if err := unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers"); err != nil {
-			log.Error(err, "Failed to set containers with config", "deployment", deploymentName)
+		if err := unstructured.SetNestedSlice(obj.Object, containers, containersPath...); err != nil {
+			log.Error(err, "Failed to set containers with config",
+				"kind", resourceKind,
+				"name", resourceName)
 			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("Failed to update containers in deployment %s: %v", deploymentName, err))
+				fmt.Sprintf("Failed to update containers in %s %s: %v", resourceKind, resourceName, err))
 		} else {
-			log.Info("Injected config into deployment",
-				"deployment", deploymentName,
+			log.Info("Injected config",
+				"kind", resourceKind,
+				"name", resourceName,
 				"variables", len(mergedVars),
 				"secrets", len(resolvedKeys))
 		}
