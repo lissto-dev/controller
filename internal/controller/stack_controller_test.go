@@ -21,13 +21,14 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
+	"github.com/lissto-dev/controller/internal/controller/testdata"
+	"github.com/lissto-dev/controller/pkg/config"
 )
 
 var _ = Describe("Stack Controller", func() {
@@ -43,42 +44,79 @@ var _ = Describe("Stack Controller", func() {
 		stack := &envv1alpha1.Stack{}
 
 		BeforeEach(func() {
-			By("creating the custom resource for the Kind Stack")
-			err := k8sClient.Get(ctx, typeNamespacedName, stack)
+			By("creating the required resources")
+
+			// Create Blueprint using testdata fixture
+			blueprint := testdata.NewBlueprint("default", "test-blueprint")
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-blueprint", Namespace: "default"}, &envv1alpha1.Blueprint{})
 			if err != nil && errors.IsNotFound(err) {
-				resource := &envv1alpha1.Stack{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
-					},
-					// TODO(user): Specify other spec details if needed.
-				}
+				Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
+			}
+
+			// Create ConfigMap using testdata fixture
+			configMap := testdata.NewManifestsConfigMap("default", "test-manifests")
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-manifests", Namespace: "default"}, &corev1.ConfigMap{})
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
+			}
+
+			// Create Stack using testdata fixture
+			err = k8sClient.Get(ctx, typeNamespacedName, stack)
+			if err != nil && errors.IsNotFound(err) {
+				resource := testdata.NewStack("default", resourceName, "default/test-blueprint", "test-manifests")
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
+			By("Cleanup the specific resource instances")
+
+			// Delete Stack
 			resource := &envv1alpha1.Stack{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
+			if err == nil {
+				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			}
 
-			By("Cleanup the specific resource instance Stack")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			// Delete ConfigMap
+			cm := &corev1.ConfigMap{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-manifests", Namespace: "default"}, cm)
+			if err == nil {
+				_ = k8sClient.Delete(ctx, cm)
+			}
+
+			// Delete Blueprint
+			bp := &envv1alpha1.Blueprint{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-blueprint", Namespace: "default"}, bp)
+			if err == nil {
+				_ = k8sClient.Delete(ctx, bp)
+			}
 		})
+
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
 			controllerReconciler := &StackReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
+				Config: &config.Config{
+					Namespaces: config.NamespacesConfig{
+						Global: "lissto-global",
+					},
+				},
 			}
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			// Verify the Stack was reconciled
+			reconciledStack := &envv1alpha1.Stack{}
+			err = k8sClient.Get(ctx, typeNamespacedName, reconciledStack)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify finalizer was added
+			Expect(reconciledStack.Finalizers).To(ContainElement("stack.lissto.dev/config-cleanup"))
 		})
 	})
 })
