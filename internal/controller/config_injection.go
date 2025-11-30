@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
@@ -384,12 +385,16 @@ func (r *StackReconciler) copySecretsToStackNamespace(ctx context.Context, stack
 		}
 		log.Info("Created stack config secret", "name", stackSecretName, "keys", len(mergedData))
 	} else {
-		// Update existing
-		existing.Data = mergedData
-		if err := r.Update(ctx, existing); err != nil {
-			return nil, missingKeys, fmt.Errorf("failed to update stack secret: %w", err)
+		// Update existing only if data has changed
+		if !reflect.DeepEqual(existing.Data, mergedData) {
+			existing.Data = mergedData
+			if err := r.Update(ctx, existing); err != nil {
+				return nil, missingKeys, fmt.Errorf("failed to update stack secret: %w", err)
+			}
+			log.Info("Updated stack config secret", "name", stackSecretName, "keys", len(mergedData))
+		} else {
+			log.V(1).Info("Stack config secret unchanged, skipping update", "name", stackSecretName)
 		}
-		log.Info("Updated stack config secret", "name", stackSecretName, "keys", len(mergedData))
 		stackSecret = existing
 	}
 

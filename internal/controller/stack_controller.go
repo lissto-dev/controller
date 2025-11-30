@@ -21,19 +21,23 @@ import (
 	"fmt"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
 	"github.com/lissto-dev/controller/pkg/config"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 const (
@@ -96,8 +100,10 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	} else {
 		// Stack is being deleted, run cleanup
 		if controllerutil.ContainsFinalizer(stack, stackFinalizerName) {
-			if err := r.cleanupConfigSecrets(ctx, stack); err != nil {
-				log.Error(err, "Failed to cleanup config secrets")
+			// Run comprehensive cleanup as safety net
+			// Owner references should handle most cleanup, but this ensures everything is gone
+			if err := r.cleanupStackResources(ctx, stack); err != nil {
+				log.Error(err, "Failed to cleanup stack resources")
 				return ctrl.Result{}, err
 			}
 
@@ -192,7 +198,8 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// Apply all resources
 	results := r.applyResources(ctx, objects, stack.Namespace)
 
-	// Set owner references on successfully applied resources
+	// Set owner references on successfully applied resources (after apply)
+	// This ensures they get garbage collected when Stack is deleted
 	r.setOwnerReferences(ctx, stack, objects, results)
 
 	// Update Stack status with results
@@ -414,7 +421,7 @@ func (r *StackReconciler) applyResources(ctx context.Context, objects []*unstruc
 				result.Applied = false
 				result.Error = err
 			} else {
-				log.Info("Applied resource",
+				log.V(1).Info("Applied resource",
 					"kind", obj.GetKind(),
 					"name", obj.GetName())
 				result.Applied = true
@@ -452,13 +459,20 @@ func (r *StackReconciler) setOwnerReferences(ctx context.Context, stack *envv1al
 
 		// Check if owner reference already exists
 		ownerRefs := obj.GetOwnerReferences()
+		hasOwnerRef := false
 		for _, ref := range ownerRefs {
 			if ref.UID == stack.UID {
 				log.Info("Owner reference already exists",
 					"kind", obj.GetKind(),
 					"name", obj.GetName())
-				continue
+				hasOwnerRef = true
+				break
 			}
+		}
+
+		// Skip setting owner reference if it already exists
+		if hasOwnerRef {
+			continue
 		}
 
 		if err := controllerutil.SetOwnerReference(stack, obj, r.Scheme); err != nil {
@@ -638,7 +652,117 @@ func (r *StackReconciler) updateStackStatus(ctx context.Context, stack *envv1alp
 	}
 }
 
+// cleanupStackResources performs comprehensive cleanup of all Stack resources
+// This acts as a safety net in case owner references didn't work properly
+func (r *StackReconciler) cleanupStackResources(ctx context.Context, stack *envv1alpha1.Stack) error {
+	log := logf.FromContext(ctx)
+
+	// List of resource types to cleanup (in deletion order)
+	// Owner references should have handled most of these, but we verify and cleanup as needed
+	resourceTypes := []struct {
+		name string
+		list client.ObjectList
+	}{
+		// Clean up workloads first (they may have finalizers)
+		{"Pods", &corev1.PodList{}},
+		{"Deployments", &appsv1.DeploymentList{}},
+
+		// Then networking
+		{"Ingresses", &networkingv1.IngressList{}},
+		{"Services", &corev1.ServiceList{}},
+
+		// Finally storage (in case workloads are holding them)
+		{"PersistentVolumeClaims", &corev1.PersistentVolumeClaimList{}},
+
+		// Secrets managed by controller
+		{"Secrets", &corev1.SecretList{}},
+	}
+
+	errorCount := 0
+	deletedCount := 0
+
+	for _, rt := range resourceTypes {
+		// List resources with Stack label (if they have it) or in Stack namespace
+		listOpts := []client.ListOption{
+			client.InNamespace(stack.Namespace),
+		}
+
+		if err := r.List(ctx, rt.list, listOpts...); err != nil {
+			log.Error(err, "Failed to list resources during cleanup", "type", rt.name)
+			errorCount++
+			continue
+		}
+
+		// Extract items from the list
+		items, err := meta.ExtractList(rt.list)
+		if err != nil {
+			log.Error(err, "Failed to extract list items", "type", rt.name)
+			errorCount++
+			continue
+		}
+
+		// Check each resource to see if it's owned by this Stack
+		for _, item := range items {
+			obj, ok := item.(client.Object)
+			if !ok {
+				continue
+			}
+
+			// Check if this resource is owned by the Stack
+			isOwned := false
+			for _, ref := range obj.GetOwnerReferences() {
+				if ref.UID == stack.UID {
+					isOwned = true
+					break
+				}
+			}
+
+			// Also check for managed-by label (for secrets)
+			labels := obj.GetLabels()
+			if labels != nil && labels["lissto.dev/stack"] == stack.Name {
+				isOwned = true
+			}
+
+			if !isOwned {
+				continue
+			}
+
+			// Delete the resource
+			if err := r.Delete(ctx, obj); err != nil {
+				if !apierrors.IsNotFound(err) {
+					log.Error(err, "Failed to delete resource during cleanup",
+						"type", rt.name,
+						"name", obj.GetName())
+					errorCount++
+				}
+			} else {
+				log.Info("Deleted resource during cleanup",
+					"type", rt.name,
+					"name", obj.GetName())
+				deletedCount++
+			}
+		}
+	}
+
+	if deletedCount > 0 {
+		log.Info("Cleaned up Stack resources via finalizer",
+			"deleted", deletedCount,
+			"errors", errorCount,
+			"note", "Most resources should be auto-deleted by owner references")
+	}
+
+	// Don't fail the finalizer if some resources couldn't be deleted
+	// Log errors but allow Stack deletion to proceed
+	if errorCount > 0 {
+		log.Error(nil, "Some resources failed to delete, but allowing Stack deletion to proceed",
+			"errorCount", errorCount)
+	}
+
+	return nil
+}
+
 // cleanupConfigSecrets cleans up orphaned config secrets that may not have owner references
+// Deprecated: Use cleanupStackResources instead
 func (r *StackReconciler) cleanupConfigSecrets(ctx context.Context, stack *envv1alpha1.Stack) error {
 	log := logf.FromContext(ctx)
 
@@ -672,6 +796,7 @@ func (r *StackReconciler) cleanupConfigSecrets(ctx context.Context, stack *envv1
 func (r *StackReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&envv1alpha1.Stack{}).
+		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		Named("stack").
 		Complete(r)
 }
