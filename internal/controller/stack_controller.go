@@ -181,13 +181,16 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 
 		// Inject config into workloads (deployments and pods)
-		configResult = r.injectConfigIntoWorkloads(ctx, objects, mergedVars, resolvedKeys, stackSecretName)
+		// Extract stack metadata for injection
+		stackMetadata := extractStackMetadata(stack)
+		configResult = r.injectConfigIntoWorkloads(ctx, objects, mergedVars, resolvedKeys, stackSecretName, stackMetadata)
 		if configResult != nil {
 			configResult.MissingSecretKeys = missingSecretKeys
 
 			log.Info("Config injection complete",
 				"variables", configResult.VariablesInjected,
 				"secrets", configResult.SecretsInjected,
+				"metadata", configResult.MetadataInjected,
 				"missingKeys", len(missingSecretKeys))
 		}
 	}

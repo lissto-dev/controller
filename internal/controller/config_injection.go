@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,12 +34,52 @@ import (
 	"github.com/lissto-dev/controller/pkg/util"
 )
 
+// Reserved environment variable prefixes that cannot be set by users
+// These are injected by the controller and override any user values
+const ReservedEnvPrefix = "LISSTO_"
+
+// isReservedEnvVar checks if an env var name is reserved
+// Any variable starting with LISSTO_ is considered reserved
+func isReservedEnvVar(name string) bool {
+	return strings.HasPrefix(name, ReservedEnvPrefix)
+}
+
 // ConfigInjectionResult tracks the result of config injection
 type ConfigInjectionResult struct {
 	VariablesInjected int
 	SecretsInjected   int
+	MetadataInjected  int                 // Count of reserved metadata variables injected
 	MissingSecretKeys map[string][]string // secretRef -> missing keys
 	Warnings          []string
+}
+
+// StackMetadata contains reserved metadata to inject as environment variables
+type StackMetadata struct {
+	Env       string
+	StackName string
+	User      string
+}
+
+// extractStackMetadata extracts metadata from Stack resource for injection
+func extractStackMetadata(stack *envv1alpha1.Stack) StackMetadata {
+	// Extract env from Stack spec (e.g., "dev-daniel", "staging")
+	env := stack.Spec.Env
+
+	// Extract user from Stack annotation
+	// Note: Annotations can be modified by users with edit permissions,
+	// but RBAC typically limits this. Can be moved to Spec later if needed.
+	user := "unknown"
+	if stack.Annotations != nil {
+		if createdBy, ok := stack.Annotations["lissto.dev/created-by"]; ok && createdBy != "" {
+			user = createdBy
+		}
+	}
+
+	return StackMetadata{
+		Env:       env,
+		StackName: stack.Name,
+		User:      user,
+	}
 }
 
 // scopePriority returns the priority of a scope (lower = higher priority)
@@ -227,6 +268,8 @@ func lenOrZeroSecrets(list *envv1alpha1.LisstoSecretList) int {
 
 // resolveVariables merges variables with hierarchy (env > repo > global)
 func (r *StackReconciler) resolveVariables(variables []envv1alpha1.LisstoVariable) map[string]string {
+	log := logf.Log.WithName("config-injection")
+
 	// Sort by priority (higher priority = lower number)
 	sort.Slice(variables, func(i, j int) bool {
 		return scopePriority(variables[i].GetScope()) > scopePriority(variables[j].GetScope())
@@ -240,7 +283,18 @@ func (r *StackReconciler) resolveVariables(variables []envv1alpha1.LisstoVariabl
 		}
 	}
 
-	return merged
+	// Filter out reserved variables
+	filtered := make(map[string]string)
+	for key, value := range merged {
+		if isReservedEnvVar(key) {
+			log.V(1).Info("Skipping reserved environment variable from LisstoVariable",
+				"key", key)
+			continue
+		}
+		filtered[key] = value
+	}
+
+	return filtered
 }
 
 // secretKeySource tracks which LisstoSecret provides each key
@@ -252,6 +306,7 @@ type secretKeySource struct {
 
 // resolveSecretKeys resolves which secret provides each key (key-level resolution)
 func (r *StackReconciler) resolveSecretKeys(secrets []envv1alpha1.LisstoSecret) map[string]secretKeySource {
+	log := logf.Log.WithName("config-injection")
 	resolved := make(map[string]secretKeySource)
 
 	for i := range secrets {
@@ -259,6 +314,14 @@ func (r *StackReconciler) resolveSecretKeys(secrets []envv1alpha1.LisstoSecret) 
 		priority := scopePriority(secret.GetScope())
 
 		for _, key := range secret.Spec.Keys {
+			// Skip reserved variable names
+			if isReservedEnvVar(key) {
+				log.V(1).Info("Skipping reserved environment variable from LisstoSecret",
+					"key", key,
+					"secret", secret.Name)
+				continue
+			}
+
 			existing, found := resolved[key]
 			if !found || priority < existing.Priority {
 				// Higher priority (lower number) wins
@@ -403,7 +466,7 @@ func (r *StackReconciler) copySecretsToStackNamespace(ctx context.Context, stack
 
 // injectConfigIntoDeployments injects environment variables and secret refs into deployments
 func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects []*unstructured.Unstructured,
-	mergedVars map[string]string, resolvedKeys map[string]secretKeySource, stackSecretName string) *ConfigInjectionResult {
+	mergedVars map[string]string, resolvedKeys map[string]secretKeySource, stackSecretName string, metadata StackMetadata) *ConfigInjectionResult {
 	log := logf.FromContext(ctx)
 	result := &ConfigInjectionResult{}
 
@@ -466,7 +529,7 @@ func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects
 			}
 
 			// Filter out existing env vars that conflict with injected ones
-			// This allows LisstoVariables/Secrets to override compose values
+			// ALSO filter out any reserved LISSTO_* variables (security)
 			filteredEnv := []interface{}{}
 			for _, envVar := range existingEnv {
 				envMap, ok := envVar.(map[string]interface{})
@@ -477,11 +540,38 @@ func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects
 				if !ok {
 					continue
 				}
-				// Keep only env vars that won't conflict
+
+				// Skip reserved variables (prevent user override)
+				if isReservedEnvVar(name) {
+					log.V(1).Info("Filtering reserved env var from compose",
+						"name", name,
+						"container", containerMap["name"])
+					continue
+				}
+
+				// Keep only env vars that won't conflict with injected config
 				if !keysToInject[name] {
 					filteredEnv = append(filteredEnv, envVar)
 				}
 			}
+
+			// Inject reserved metadata variables (highest priority - controller-managed)
+			// These are ALWAYS injected and cannot be opted out
+			filteredEnv = append(filteredEnv,
+				map[string]interface{}{
+					"name":  "LISSTO_ENV",
+					"value": metadata.Env,
+				},
+				map[string]interface{}{
+					"name":  "LISSTO_STACK",
+					"value": metadata.StackName,
+				},
+				map[string]interface{}{
+					"name":  "LISSTO_USER",
+					"value": metadata.User,
+				},
+			)
+			result.MetadataInjected = 3
 
 			// Add merged variables (these override compose values, but NOT secrets)
 			for key, value := range mergedVars {
