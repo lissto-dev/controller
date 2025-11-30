@@ -8,7 +8,6 @@ logging:
 namespaces:
   global: "lissto-global"
   developerPrefix: "dev-"
-  autoCreatePrefix: true
 
 repos:
   main:
@@ -17,10 +16,15 @@ repos:
     branches: ["main", "master"]
 
 stacks:
-  global:
-    images:
-      registry: "123.ecr.aws.amazon.com"
-      repositoryPrefix: "lissto-dev/"
-  public:
-    ingressClass: "haproxy"
-    hostSuffix: ".dev.lissto.dev"
+  images:
+    registry: "123.ecr.aws.amazon.com"
+    repositoryPrefix: "lissto-dev/"
+  ingress:
+    internal:
+      ingressClass: "haproxy"
+      hostSuffix: ".dev.lissto.dev"
+      tlsSecret: "wildcard-tls"
+    internet:
+      ingressClass: "haproxy-public"
+      hostSuffix: ".dev-public.lissto.dev"
+      tlsSecret: "wildcard-internet-tls"

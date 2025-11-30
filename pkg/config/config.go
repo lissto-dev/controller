@@ -35,9 +35,8 @@ type LoggingConfig struct {
 
 // NamespacesConfig holds namespace scoping configuration
 type NamespacesConfig struct {
-	Global           string `yaml:"global"`
-	DeveloperPrefix  string `yaml:"developerPrefix"`
-	AutoCreatePrefix bool   `yaml:"autoCreatePrefix"`
+	Global          string `yaml:"global"`
+	DeveloperPrefix string `yaml:"developerPrefix"`
 }
 
 // RepoConfig holds repository configuration
@@ -47,21 +46,23 @@ type RepoConfig struct {
 	Branches []string `yaml:"branches"`
 }
 
-// StacksConfig holds stack configuration for ingress objects
+// StacksConfig holds stack configuration
 type StacksConfig struct {
-	Public PublicConfig `yaml:"public"`
-	Global GlobalConfig `yaml:"global,omitempty"`
+	Images  ImagesConfig  `yaml:"images,omitempty"`
+	Ingress IngressConfig `yaml:"ingress"`
 }
 
-// PublicConfig holds public configuration for ingress objects
-type PublicConfig struct {
+// IngressConfig holds ingress configurations for different visibility types
+type IngressConfig struct {
+	Internal *VisibilityConfig `yaml:"internal,omitempty"`
+	Internet *VisibilityConfig `yaml:"internet,omitempty"`
+}
+
+// VisibilityConfig holds configuration for a specific ingress visibility type
+type VisibilityConfig struct {
 	IngressClass string `yaml:"ingressClass"`
 	HostSuffix   string `yaml:"hostSuffix"`
-}
-
-// GlobalConfig holds global configuration
-type GlobalConfig struct {
-	Images ImagesConfig `yaml:"images,omitempty"`
+	TLSSecret    string `yaml:"tlsSecret"`
 }
 
 // ImagesConfig holds image resolution configuration
@@ -123,14 +124,40 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Validate Stacks
-	if c.Stacks.Public.IngressClass == "" {
-		return fmt.Errorf("stacks.public.ingressClass is required")
-	}
-	if c.Stacks.Public.HostSuffix == "" {
-		return fmt.Errorf("stacks.public.hostSuffix is required")
+	// Validate Stacks - at least one visibility type must be configured
+	if c.Stacks.Ingress.Internal == nil && c.Stacks.Ingress.Internet == nil {
+		return fmt.Errorf("at least one of stacks.ingress.internal or stacks.ingress.internet must be configured")
 	}
 
+	// Validate Internal config if present
+	if c.Stacks.Ingress.Internal != nil {
+		if err := validateVisibilityConfig(c.Stacks.Ingress.Internal, "internal"); err != nil {
+			return err
+		}
+	}
+
+	// Validate Internet config if present
+	if c.Stacks.Ingress.Internet != nil {
+		if err := validateVisibilityConfig(c.Stacks.Ingress.Internet, "internet"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateVisibilityConfig validates a single visibility configuration
+func validateVisibilityConfig(vc *VisibilityConfig, name string) error {
+	if vc.IngressClass == "" {
+		return fmt.Errorf("stacks.ingress.%s.ingressClass is required", name)
+	}
+	if vc.HostSuffix == "" {
+		return fmt.Errorf("stacks.ingress.%s.hostSuffix is required", name)
+	}
+	// STRICT: TLS secret is required if host suffix is provided
+	if vc.HostSuffix != "" && vc.TLSSecret == "" {
+		return fmt.Errorf("stacks.ingress.%s.tlsSecret is required when hostSuffix is configured (TLS is mandatory)", name)
+	}
 	return nil
 }
 
@@ -216,9 +243,8 @@ func DefaultConfig() *Config {
 			Level: "info",
 		},
 		Namespaces: NamespacesConfig{
-			Global:           "lissto-global",
-			DeveloperPrefix:  "dev-",
-			AutoCreatePrefix: true,
+			Global:          "lissto-global",
+			DeveloperPrefix: "dev-",
 		},
 		Repos: map[string]RepoConfig{
 			"main": {
@@ -228,9 +254,16 @@ func DefaultConfig() *Config {
 			},
 		},
 		Stacks: StacksConfig{
-			Public: PublicConfig{
-				IngressClass: "nginx",
-				HostSuffix:   ".example.com",
+			Images: ImagesConfig{
+				Registry:         "",
+				RepositoryPrefix: "",
+			},
+			Ingress: IngressConfig{
+				Internal: &VisibilityConfig{
+					IngressClass: "nginx",
+					HostSuffix:   ".internal.example.com",
+					TLSSecret:    "wildcard-internal-tls",
+				},
 			},
 		},
 	}

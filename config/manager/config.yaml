@@ -23,7 +23,6 @@ data:
     namespaces:
       global: "lissto-global"
       developerPrefix: "dev-"
-      autoCreatePrefix: true
       globalBranches:
         - main
         - master
