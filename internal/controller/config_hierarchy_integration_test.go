@@ -84,8 +84,8 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			blueprint.Spec.DockerCompose = testdata.ComposeForHierarchyTest
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
-			// Create manifests ConfigMap
-			manifests := testdata.NewManifestsConfigMapWithContent(testNamespace, "test-manifests", testdata.DeploymentManifest)
+			// Create manifests ConfigMap with VAR1, VAR2, VAR3 declared
+			manifests := testdata.NewDeploymentConfigMapWithEnvNames(testNamespace, "test-manifests", "web", "VAR1", "VAR2", "VAR3")
 			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
 
 			// Create global-scoped variable with unique name
@@ -157,8 +157,8 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			blueprint.Spec.DockerCompose = testdata.ComposeForHierarchyTest
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
-			// Create manifests ConfigMap
-			manifests := testdata.NewManifestsConfigMapWithContent(testNamespace, "test-manifests", testdata.DeploymentManifest)
+			// Create manifests ConfigMap (empty env)
+			manifests := testdata.NewDeploymentConfigMapWithEnvNames(testNamespace, "test-manifests", "web")
 			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
 
 			// Create env-scoped variable for "prod"
@@ -204,8 +204,8 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			blueprint.Spec.DockerCompose = testdata.ComposeForHierarchyTest
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
-			// Create manifests ConfigMap
-			manifests := testdata.NewManifestsConfigMapWithContent(testNamespace, "test-manifests", testdata.DeploymentManifest)
+			// Create manifests ConfigMap (empty env)
+			manifests := testdata.NewDeploymentConfigMapWithEnvNames(testNamespace, "test-manifests", "web")
 			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
 
 			// Create repo-scoped variable for different repository
@@ -249,8 +249,8 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			blueprint.Spec.DockerCompose = testdata.ComposeForHierarchyTest
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
-			// Create manifests ConfigMap
-			manifests := testdata.NewManifestsConfigMapWithContent(testNamespace, "test-manifests", testdata.DeploymentManifest)
+			// Create manifests ConfigMap with GLOBAL_VAR declared
+			manifests := testdata.NewDeploymentConfigMapWithEnvNames(testNamespace, "test-manifests", "web", "GLOBAL_VAR")
 			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
 
 			// Create global-scoped variable with unique name
@@ -307,8 +307,8 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			blueprint.Spec.DockerCompose = testdata.ComposeForHierarchyTest
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
-			// Create manifests ConfigMap
-			manifests := testdata.NewManifestsConfigMapWithContent(testNamespace, "test-manifests", testdata.DeploymentManifest)
+			// Create manifests ConfigMap with KEY1, KEY2, KEY3 declared
+			manifests := testdata.NewDeploymentConfigMapWithEnvNames(testNamespace, "test-manifests", "web", "KEY1", "KEY2", "KEY3")
 			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
 
 			// Create K8s Secrets with actual data (unique names)
@@ -395,7 +395,11 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
 			// Create manifests ConfigMap with env vars (simulating kompose output)
-			manifests := testdata.NewManifestsConfigMapWithContent(testNamespace, "test-manifests", testdata.DeploymentWithEnvVarsManifest)
+			manifests := testdata.NewDeploymentConfigMap(testNamespace, "test-manifests", "web", []testdata.EnvVar{
+				testdata.Env("COMPOSE_VAR", "from-compose"),
+				testdata.Env("PORT", "8080"),
+				testdata.Env("DEBUG", "false"),
+			})
 			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
 
 			// Create Stack (no LisstoVariables)
@@ -440,7 +444,13 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
 			// Create manifests ConfigMap with env vars (simulating kompose output)
-			manifests := testdata.NewManifestsConfigMapWithContent(testNamespace, "test-manifests", testdata.DeploymentWithEnvVarsManifest)
+			manifests := testdata.NewDeploymentConfigMap(testNamespace, "test-manifests", "web", []testdata.EnvVar{
+				testdata.Env("COMPOSE_VAR", "from-compose"),
+				testdata.Env("PORT", "8080"),
+				testdata.Env("DEBUG", "false"),
+				testdata.EmptyEnv("INJECTED_VAR"),
+				testdata.EmptyEnv("ANOTHER_VAR"),
+			})
 			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
 
 			// Create LisstoVariable with non-conflicting keys
@@ -497,7 +507,11 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
 			// Create manifests ConfigMap with conflicting vars (simulating kompose output)
-			manifests := testdata.NewManifestsConfigMapWithContent(testNamespace, "test-manifests", testdata.DeploymentWithConflictingVarsManifest)
+			manifests := testdata.NewDeploymentConfigMap(testNamespace, "test-manifests", "web", []testdata.EnvVar{
+				testdata.Env("DATABASE_HOST", "localhost"),
+				testdata.Env("PORT", "8080"),
+				testdata.Env("DEBUG", "false"),
+			})
 			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
 
 			// Create LisstoVariable with conflicting keys
@@ -561,7 +575,11 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
 			// Create manifests ConfigMap with DATABASE_HOST from compose
-			manifests := testdata.NewManifestsConfigMapWithContent(testNamespace, "test-manifests", testdata.DeploymentWithConflictingVarsManifest)
+			manifests := testdata.NewDeploymentConfigMap(testNamespace, "test-manifests", "web", []testdata.EnvVar{
+				testdata.Env("DATABASE_HOST", "localhost"),
+				testdata.Env("PORT", "8080"),
+				testdata.Env("DEBUG", "false"),
+			})
 			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
 
 			// Create K8s Secret with DATABASE_HOST value
@@ -629,36 +647,14 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			// secret has: SECRET_PASSWORD key  (overrides both)
 
 			// Create manifests with SECRET_PASSWORD from compose
-			manifestWithSecret := `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: web
-  labels:
-    io.kompose.service: web
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      io.kompose.service: web
-  template:
-    metadata:
-      labels:
-        io.kompose.service: web
-    spec:
-      containers:
-      - name: web
-        image: nginx:latest
-        env:
-        - name: SECRET_PASSWORD
-          value: compose-insecure
-        - name: OTHER_VAR
-          value: keep-me
-`
 			blueprint := testdata.NewBlueprint(testNamespace, "test-blueprint")
 			blueprint.Spec.DockerCompose = testdata.ComposeForHierarchyTest
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
-			manifests := testdata.NewManifestsConfigMapWithContent(testNamespace, "test-manifests", manifestWithSecret)
+			manifests := testdata.NewDeploymentConfigMap(testNamespace, "test-manifests", "web", []testdata.EnvVar{
+				testdata.Env("SECRET_PASSWORD", "compose-insecure"),
+				testdata.Env("OTHER_VAR", "keep-me"),
+			})
 			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
 
 			// Create K8s Secret
@@ -732,8 +728,8 @@ spec:
 			blueprint.Spec.DockerCompose = testdata.ComposeForHierarchyTest
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
-			// Create manifests ConfigMap
-			manifests := testdata.NewManifestsConfigMapWithContent(testNamespace, "test-manifests", testdata.DeploymentManifest)
+			// Create manifests ConfigMap with PUBLIC_VAR and SECRET_KEY declared
+			manifests := testdata.NewDeploymentConfigMapWithEnvNames(testNamespace, "test-manifests", "web", "PUBLIC_VAR", "SECRET_KEY")
 			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
 
 			// Create K8s Secret
@@ -791,6 +787,257 @@ spec:
 
 			Expect(hasPublicVar).To(BeTrue(), "Should have LisstoVariable injected as value")
 			Expect(hasSecretRef).To(BeTrue(), "Should have LisstoSecret injected as secretKeyRef")
+		})
+	})
+
+	Context("Opt-in Injection - Only Inject Declared Variables", func() {
+		It("should NOT inject global variables that aren't declared in compose", func() {
+			// Create Blueprint with compose that has specific env vars
+			blueprint := testdata.NewBlueprint(testNamespace, "test-blueprint")
+			blueprint.Spec.DockerCompose = testdata.ComposeForHierarchyTest
+			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
+
+			// Create manifests with only DATABASE_URL and PORT declared (using builder)
+			manifests := testdata.NewDeploymentConfigMap(testNamespace, "test-manifests", "web", []testdata.EnvVar{
+				testdata.EmptyEnv("DATABASE_URL"),
+				testdata.Env("PORT", "3000"),
+			})
+			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
+
+			// Create global variable with both declared and undeclared vars
+			globalVarName := fmt.Sprintf("global-vars-%d", time.Now().UnixNano())
+			globalVar := testdata.NewGlobalScopedVariable(globalNamespace, globalVarName, map[string]string{
+				"DATABASE_URL":   "db.global.com",     // Declared in compose
+				"PORT":           "8080",              // Declared in compose
+				"UNDECLARED_VAR": "should-not-inject", // NOT declared in compose
+				"ANOTHER_GLOBAL": "also-not-injected", // NOT declared in compose
+			})
+			Expect(k8sClient.Create(ctx, globalVar)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, globalVar)
+			}()
+
+			// Create Stack
+			stack := testdata.NewStack(testNamespace, "test-stack",
+				fmt.Sprintf("%s/test-blueprint", testNamespace), "test-manifests")
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Trigger reconciliation
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-stack",
+					Namespace: testNamespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify Deployment has only declared variables
+			deployment := &appsv1.Deployment{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "web",
+					Namespace: testNamespace,
+				}, deployment)
+			}, 5*time.Second, 500*time.Millisecond).Should(Succeed())
+
+			env := deployment.Spec.Template.Spec.Containers[0].Env
+			envMap := make(map[string]string)
+			for _, e := range env {
+				if e.Value != "" {
+					envMap[e.Name] = e.Value
+				}
+			}
+
+			// Verify declared variables ARE injected
+			Expect(envMap["DATABASE_URL"]).To(Equal("db.global.com"), "DATABASE_URL should be injected (declared in compose)")
+			Expect(envMap["PORT"]).To(Equal("8080"), "PORT should be injected (declared in compose)")
+
+			// Verify undeclared variables are NOT injected
+			Expect(envMap).NotTo(HaveKey("UNDECLARED_VAR"), "UNDECLARED_VAR should NOT be injected (not declared in compose)")
+			Expect(envMap).NotTo(HaveKey("ANOTHER_GLOBAL"), "ANOTHER_GLOBAL should NOT be injected (not declared in compose)")
+		})
+
+		It("should inject global variables that ARE declared in compose", func() {
+			// Create Blueprint
+			blueprint := testdata.NewBlueprint(testNamespace, "test-blueprint")
+			blueprint.Spec.DockerCompose = testdata.ComposeForHierarchyTest
+			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
+
+			// Create manifests with DATABASE_URL declared (using builder with just names)
+			manifests := testdata.NewDeploymentConfigMapWithEnvNames(testNamespace, "test-manifests", "web", "DATABASE_URL")
+			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
+
+			// Create global variable with DATABASE_URL and API_KEY
+			globalVarName := fmt.Sprintf("global-vars-%d", time.Now().UnixNano())
+			globalVar := testdata.NewGlobalScopedVariable(globalNamespace, globalVarName, map[string]string{
+				"DATABASE_URL": "db.global.com", // Declared in compose
+				"API_KEY":      "secret-key",    // NOT declared in compose
+			})
+			Expect(k8sClient.Create(ctx, globalVar)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, globalVar)
+			}()
+
+			// Create Stack
+			stack := testdata.NewStack(testNamespace, "test-stack",
+				fmt.Sprintf("%s/test-blueprint", testNamespace), "test-manifests")
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Trigger reconciliation
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-stack",
+					Namespace: testNamespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify Deployment
+			deployment := &appsv1.Deployment{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "web",
+					Namespace: testNamespace,
+				}, deployment)
+			}, 5*time.Second, 500*time.Millisecond).Should(Succeed())
+
+			env := deployment.Spec.Template.Spec.Containers[0].Env
+			envMap := make(map[string]string)
+			for _, e := range env {
+				if e.Value != "" {
+					envMap[e.Name] = e.Value
+				}
+			}
+
+			// Verify DATABASE_URL gets the global value
+			Expect(envMap["DATABASE_URL"]).To(Equal("db.global.com"), "DATABASE_URL should be injected (declared in compose)")
+
+			// Verify API_KEY is NOT injected
+			Expect(envMap).NotTo(HaveKey("API_KEY"), "API_KEY should NOT be injected (not declared in compose)")
+		})
+
+		It("should always inject LISSTO_* metadata regardless of compose", func() {
+			// Create Blueprint without any LISSTO_* variables
+			blueprint := testdata.NewBlueprint(testNamespace, "test-blueprint")
+			blueprint.Spec.DockerCompose = testdata.ComposeForHierarchyTest
+			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
+
+			// Create manifests without LISSTO_* variables (empty env)
+			manifests := testdata.NewDeploymentConfigMapWithEnvNames(testNamespace, "test-manifests", "web")
+			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
+
+			// Create Stack with specific env
+			stack := testdata.NewStack(testNamespace, "test-stack",
+				fmt.Sprintf("%s/test-blueprint", testNamespace), "test-manifests")
+			stack.Spec.Env = "production"
+			stack.Annotations = map[string]string{
+				"lissto.dev/created-by": "test-user",
+			}
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Trigger reconciliation
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-stack",
+					Namespace: testNamespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify Deployment has LISSTO_* metadata
+			deployment := &appsv1.Deployment{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "web",
+					Namespace: testNamespace,
+				}, deployment)
+			}, 5*time.Second, 500*time.Millisecond).Should(Succeed())
+
+			env := deployment.Spec.Template.Spec.Containers[0].Env
+			envMap := make(map[string]string)
+			for _, e := range env {
+				if e.Value != "" {
+					envMap[e.Name] = e.Value
+				}
+			}
+
+			// Verify LISSTO_* metadata is always injected
+			Expect(envMap["LISSTO_ENV"]).To(Equal("production"), "LISSTO_ENV should always be injected")
+			Expect(envMap["LISSTO_STACK"]).To(Equal("test-stack"), "LISSTO_STACK should always be injected")
+			Expect(envMap["LISSTO_USER"]).To(Equal("test-user"), "LISSTO_USER should always be injected")
+		})
+
+		It("should NOT inject global secrets that aren't declared in compose", func() {
+			// Create Blueprint
+			blueprint := testdata.NewBlueprint(testNamespace, "test-blueprint")
+			blueprint.Spec.DockerCompose = testdata.ComposeForHierarchyTest
+			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
+
+			// Create manifests with only API_TOKEN declared
+			manifests := testdata.NewDeploymentConfigMapWithEnvNames(testNamespace, "test-manifests", "web", "API_TOKEN")
+			Expect(k8sClient.Create(ctx, manifests)).To(Succeed())
+
+			// Create K8s Secret with both declared and undeclared keys
+			globalSecretName := fmt.Sprintf("global-secrets-data-%d", time.Now().UnixNano())
+			globalK8sSecret := testdata.NewKubernetesSecret(globalNamespace, globalSecretName, map[string]string{
+				"API_TOKEN":          "token-value",              // Declared in compose
+				"UNDECLARED_SECRET":  "should-not-inject-secret", // NOT declared
+				"ANOTHER_UNDECLARED": "also-not-injected",        // NOT declared
+			})
+			Expect(k8sClient.Create(ctx, globalK8sSecret)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, globalK8sSecret)
+			}()
+
+			// Create LisstoSecret with all keys (declared and undeclared)
+			globalLisstoSecretName := fmt.Sprintf("global-secrets-%d", time.Now().UnixNano())
+			globalSecret := testdata.NewGlobalScopedSecret(globalNamespace, globalLisstoSecretName,
+				[]string{"API_TOKEN", "UNDECLARED_SECRET", "ANOTHER_UNDECLARED"},
+				globalSecretName)
+			Expect(k8sClient.Create(ctx, globalSecret)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, globalSecret)
+			}()
+
+			// Create Stack
+			stack := testdata.NewStack(testNamespace, "test-stack",
+				fmt.Sprintf("%s/test-blueprint", testNamespace), "test-manifests")
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Trigger reconciliation
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-stack",
+					Namespace: testNamespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify Deployment has only declared secrets
+			deployment := &appsv1.Deployment{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "web",
+					Namespace: testNamespace,
+				}, deployment)
+			}, 5*time.Second, 500*time.Millisecond).Should(Succeed())
+
+			env := deployment.Spec.Template.Spec.Containers[0].Env
+
+			// Check which secrets are present
+			secretRefs := make(map[string]bool)
+			for _, e := range env {
+				if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+					secretRefs[e.Name] = true
+				}
+			}
+
+			// Verify declared secret IS injected
+			Expect(secretRefs["API_TOKEN"]).To(BeTrue(), "API_TOKEN should be injected (declared in compose)")
+
+			// Verify undeclared secrets are NOT injected
+			Expect(secretRefs).NotTo(HaveKey("UNDECLARED_SECRET"), "UNDECLARED_SECRET should NOT be injected (not declared in compose)")
+			Expect(secretRefs).NotTo(HaveKey("ANOTHER_UNDECLARED"), "ANOTHER_UNDECLARED should NOT be injected (not declared in compose)")
 		})
 	})
 })

@@ -67,7 +67,8 @@ func NewManifestsConfigMapWithContent(namespace, name, manifestContent string) *
 // NewDeploymentAndPodManifestsConfigMap creates a ConfigMap with both Deployment and Pod manifests
 // Used for integration tests that verify both resource types
 func NewDeploymentAndPodManifestsConfigMap(namespace, name string) *corev1.ConfigMap {
-	return NewManifestsConfigMapWithContent(namespace, name, DeploymentAndPodManifest)
+	manifest := NewDeploymentAndPodManifest("web", "migrate", nil, nil) // Empty env vars
+	return NewManifestsConfigMapWithContent(namespace, name, manifest)
 }
 
 // NewStack creates a Stack without images (for basic reconciliation tests)
@@ -114,121 +115,63 @@ func NewStackWithImages(namespace, name, blueprintRef, configMapName string) *en
 	}
 }
 
-// NewLisstoVariable creates a LisstoVariable for testing config injection
-func NewLisstoVariable(namespace, name string, data map[string]string) *envv1alpha1.LisstoVariable {
+// NewLisstoVariable creates a LisstoVariable with specified scope
+// scope: "env", "repo", or "global"
+// scopeValue: env name for "env" scope, repository for "repo" scope, empty for "global"
+func NewLisstoVariable(namespace, name, scope, scopeValue string, data map[string]string) *envv1alpha1.LisstoVariable {
+	spec := envv1alpha1.LisstoVariableSpec{Scope: scope, Data: data}
+	switch scope {
+	case "env":
+		spec.Env = scopeValue
+	case "repo":
+		spec.Repository = scopeValue
+	}
 	return &envv1alpha1.LisstoVariable{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: envv1alpha1.LisstoVariableSpec{
-			Data: data,
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec:       spec,
 	}
 }
 
-// NewLisstoSecret creates a LisstoSecret for testing secret injection
-func NewLisstoSecret(namespace, name string, keys []string) *envv1alpha1.LisstoSecret {
+// NewLisstoSecret creates a LisstoSecret with specified scope
+// scope: "env", "repo", or "global"
+// scopeValue: env name for "env" scope, repository for "repo" scope, empty for "global"
+func NewLisstoSecret(namespace, name, scope, scopeValue string, keys []string, secretRef string) *envv1alpha1.LisstoSecret {
+	spec := envv1alpha1.LisstoSecretSpec{Scope: scope, Keys: keys, SecretRef: secretRef}
+	switch scope {
+	case "env":
+		spec.Env = scopeValue
+	case "repo":
+		spec.Repository = scopeValue
+	}
 	return &envv1alpha1.LisstoSecret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: envv1alpha1.LisstoSecretSpec{
-			Keys: keys,
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec:       spec,
 	}
 }
 
-// NewEnvScopedVariable creates a LisstoVariable with env scope
+// Backward compatibility wrappers (can be removed if you update all tests)
 func NewEnvScopedVariable(namespace, name, env string, data map[string]string) *envv1alpha1.LisstoVariable {
-	return &envv1alpha1.LisstoVariable{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: envv1alpha1.LisstoVariableSpec{
-			Scope: "env",
-			Env:   env,
-			Data:  data,
-		},
-	}
+	return NewLisstoVariable(namespace, name, "env", env, data)
 }
 
-// NewRepoScopedVariable creates a LisstoVariable with repo scope
 func NewRepoScopedVariable(namespace, name, repository string, data map[string]string) *envv1alpha1.LisstoVariable {
-	return &envv1alpha1.LisstoVariable{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: envv1alpha1.LisstoVariableSpec{
-			Scope:      "repo",
-			Repository: repository,
-			Data:       data,
-		},
-	}
+	return NewLisstoVariable(namespace, name, "repo", repository, data)
 }
 
-// NewGlobalScopedVariable creates a LisstoVariable with global scope
 func NewGlobalScopedVariable(namespace, name string, data map[string]string) *envv1alpha1.LisstoVariable {
-	return &envv1alpha1.LisstoVariable{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: envv1alpha1.LisstoVariableSpec{
-			Scope: "global",
-			Data:  data,
-		},
-	}
+	return NewLisstoVariable(namespace, name, "global", "", data)
 }
 
-// NewEnvScopedSecret creates a LisstoSecret with env scope
 func NewEnvScopedSecret(namespace, name, env string, keys []string, secretRef string) *envv1alpha1.LisstoSecret {
-	return &envv1alpha1.LisstoSecret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: envv1alpha1.LisstoSecretSpec{
-			Scope:     "env",
-			Env:       env,
-			Keys:      keys,
-			SecretRef: secretRef,
-		},
-	}
+	return NewLisstoSecret(namespace, name, "env", env, keys, secretRef)
 }
 
-// NewRepoScopedSecret creates a LisstoSecret with repo scope
 func NewRepoScopedSecret(namespace, name, repository string, keys []string, secretRef string) *envv1alpha1.LisstoSecret {
-	return &envv1alpha1.LisstoSecret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: envv1alpha1.LisstoSecretSpec{
-			Scope:      "repo",
-			Repository: repository,
-			Keys:       keys,
-			SecretRef:  secretRef,
-		},
-	}
+	return NewLisstoSecret(namespace, name, "repo", repository, keys, secretRef)
 }
 
-// NewGlobalScopedSecret creates a LisstoSecret with global scope
 func NewGlobalScopedSecret(namespace, name string, keys []string, secretRef string) *envv1alpha1.LisstoSecret {
-	return &envv1alpha1.LisstoSecret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: envv1alpha1.LisstoSecretSpec{
-			Scope:     "global",
-			Keys:      keys,
-			SecretRef: secretRef,
-		},
-	}
+	return NewLisstoSecret(namespace, name, "global", "", keys, secretRef)
 }
 
 // NewKubernetesSecret creates a K8s Secret for testing LisstoSecret resolution
@@ -244,4 +187,16 @@ func NewKubernetesSecret(namespace, name string, data map[string]string) *corev1
 		},
 		Data: secretData,
 	}
+}
+
+// NewDeploymentConfigMap creates a ConfigMap with a dynamically generated Deployment manifest
+func NewDeploymentConfigMap(namespace, name, deploymentName string, envVars []EnvVar) *corev1.ConfigMap {
+	manifest := NewDeploymentManifest(deploymentName, envVars)
+	return NewManifestsConfigMapWithContent(namespace, name, manifest)
+}
+
+// NewDeploymentConfigMapWithEnvNames creates a ConfigMap with a Deployment that has named env vars (empty values)
+func NewDeploymentConfigMapWithEnvNames(namespace, name, deploymentName string, envNames ...string) *corev1.ConfigMap {
+	manifest := NewDeploymentManifestWithEnvNames(deploymentName, envNames...)
+	return NewManifestsConfigMapWithContent(namespace, name, manifest)
 }

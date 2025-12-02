@@ -1,6 +1,12 @@
 package testdata
 
+import (
+	"bytes"
+	"text/template"
+)
+
 // BasicManifest is a simple Service manifest for basic tests
+// Kept as constant since it's a different resource type (Service, not Deployment/Pod)
 const BasicManifest = `apiVersion: v1
 kind: Service
 metadata:
@@ -12,126 +18,119 @@ spec:
   - port: 80
 `
 
-// DeploymentAndPodManifest contains both a Deployment and a Pod
-// Used for testing image and config injection into both resource types
-const DeploymentAndPodManifest = `
-apiVersion: apps/v1
+// EnvVar represents an environment variable with name and optional value
+type EnvVar struct {
+	Name  string
+	Value string
+}
+
+// Template definitions
+var (
+	deploymentTemplate = template.Must(template.New("deployment").Parse(`apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: web
+  name: {{ .Name }}
   labels:
-    io.kompose.service: web
+    io.kompose.service: {{ .Name }}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      io.kompose.service: web
+      io.kompose.service: {{ .Name }}
   template:
     metadata:
       labels:
-        io.kompose.service: web
+        io.kompose.service: {{ .Name }}
     spec:
       containers:
-      - name: web
+      - name: {{ .Name }}
         image: nginx:latest
+{{- if .EnvVars }}
+        env:
+{{- range .EnvVars }}
+        - name: {{ .Name }}
+          value: {{ .Value | printf "%q" }}
+{{- end }}
+{{- else }}
         env: []
----
-apiVersion: v1
+{{- end }}
+`))
+
+	podTemplate = template.Must(template.New("pod").Parse(`apiVersion: v1
 kind: Pod
 metadata:
-  name: migrate
+  name: {{ .Name }}
   labels:
-    io.kompose.service: migrate
+    io.kompose.service: {{ .Name }}
 spec:
   restartPolicy: Never
   containers:
-  - name: migrate
+  - name: {{ .Name }}
     image: migrate:latest
+{{- if .EnvVars }}
+    env:
+{{- range .EnvVars }}
+    - name: {{ .Name }}
+      value: {{ .Value | printf "%q" }}
+{{- end }}
+{{- else }}
     env: []
-`
+{{- end }}
+`))
+)
 
-// DeploymentManifest is a simple Deployment for testing
-const DeploymentManifest = `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: web
-  labels:
-    io.kompose.service: web
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      io.kompose.service: web
-  template:
-    metadata:
-      labels:
-        io.kompose.service: web
-    spec:
-      containers:
-      - name: web
-        image: nginx:latest
-        ports:
-        - containerPort: 80
-        env: []
-`
+// manifestData holds template data for manifest generation
+type manifestData struct {
+	Name    string
+	EnvVars []EnvVar
+}
 
-// DeploymentWithEnvVarsManifest is a Deployment with predefined env vars (from compose)
-const DeploymentWithEnvVarsManifest = `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: web
-  labels:
-    io.kompose.service: web
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      io.kompose.service: web
-  template:
-    metadata:
-      labels:
-        io.kompose.service: web
-    spec:
-      containers:
-      - name: web
-        image: nginx:latest
-        env:
-        - name: COMPOSE_VAR
-          value: from-compose
-        - name: PORT
-          value: "8080"
-        - name: DEBUG
-          value: "false"
-`
+// NewDeploymentManifest creates a Deployment manifest with specified environment variables
+// If envVars is empty, creates a deployment with env: []
+func NewDeploymentManifest(name string, envVars []EnvVar) string {
+	var buf bytes.Buffer
+	data := manifestData{Name: name, EnvVars: envVars}
+	if err := deploymentTemplate.Execute(&buf, data); err != nil {
+		panic(err) // Should never happen with valid template
+	}
+	return buf.String()
+}
 
-// DeploymentWithConflictingVarsManifest for testing last-one-wins
-// Note: Manifests from kompose would have these as initial env vars
-// When LisstoVariables are injected, they get appended
-// K8s doesn't allow duplicates in Apply, so this test verifies both are added
-const DeploymentWithConflictingVarsManifest = `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: web
-  labels:
-    io.kompose.service: web
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      io.kompose.service: web
-  template:
-    metadata:
-      labels:
-        io.kompose.service: web
-    spec:
-      containers:
-      - name: web
-        image: nginx:latest
-        env:
-        - name: DATABASE_HOST
-          value: localhost
-        - name: PORT
-          value: "8080"
-        - name: DEBUG
-          value: "false"
-`
+// NewDeploymentManifestWithEnvNames creates a Deployment with empty-valued env vars
+// Useful for opt-in testing where you just need the names declared
+func NewDeploymentManifestWithEnvNames(name string, envNames ...string) string {
+	envVars := make([]EnvVar, len(envNames))
+	for i, envName := range envNames {
+		envVars[i] = EnvVar{Name: envName, Value: ""}
+	}
+	return NewDeploymentManifest(name, envVars)
+}
+
+// NewPodManifest creates a Pod manifest with specified environment variables
+func NewPodManifest(name string, envVars []EnvVar) string {
+	var buf bytes.Buffer
+	data := manifestData{Name: name, EnvVars: envVars}
+	if err := podTemplate.Execute(&buf, data); err != nil {
+		panic(err) // Should never happen with valid template
+	}
+	return buf.String()
+}
+
+// NewDeploymentAndPodManifest creates both Deployment and Pod with specified env vars
+func NewDeploymentAndPodManifest(deploymentName, podName string, deploymentEnv, podEnv []EnvVar) string {
+	deployment := NewDeploymentManifest(deploymentName, deploymentEnv)
+	pod := NewPodManifest(podName, podEnv)
+	return deployment + "---\n" + pod
+}
+
+// Helper functions for common patterns
+
+// EmptyEnv creates an empty env var (name with empty value)
+func EmptyEnv(name string) EnvVar {
+	return EnvVar{Name: name, Value: ""}
+}
+
+// Env creates an env var with a value
+func Env(name, value string) EnvVar {
+	return EnvVar{Name: name, Value: value}
+}

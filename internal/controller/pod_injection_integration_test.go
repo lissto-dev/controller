@@ -157,8 +157,17 @@ var _ = Describe("Pod and Deployment Integration Tests", func() {
 			blueprint := testdata.NewBlueprintWithCompose(testNamespace, blueprintName, testdata.MultiServiceCompose)
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
-			// Create ConfigMap
-			configMap := testdata.NewDeploymentAndPodManifestsConfigMap(testNamespace, configMapName)
+			// Create ConfigMap with ENV and LOG_LEVEL declared
+			deploymentEnv := []testdata.EnvVar{
+				testdata.EmptyEnv("ENV"),
+				testdata.EmptyEnv("LOG_LEVEL"),
+			}
+			podEnv := []testdata.EnvVar{
+				testdata.EmptyEnv("ENV"),
+				testdata.EmptyEnv("LOG_LEVEL"),
+			}
+			manifest := testdata.NewDeploymentAndPodManifest("web", "migrate", deploymentEnv, podEnv)
+			configMap := testdata.NewManifestsConfigMapWithContent(testNamespace, configMapName, manifest)
 			Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
 
 			// Create Stack
@@ -239,8 +248,17 @@ var _ = Describe("Pod and Deployment Integration Tests", func() {
 			blueprint := testdata.NewBlueprintWithCompose(testNamespace, blueprintName, testdata.MultiServiceCompose)
 			Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
 
-			// Create ConfigMap
-			configMap := testdata.NewDeploymentAndPodManifestsConfigMap(testNamespace, configMapName)
+			// Create ConfigMap with API_KEY and DB_PASSWORD declared
+			deploymentEnv := []testdata.EnvVar{
+				testdata.EmptyEnv("API_KEY"),
+				testdata.EmptyEnv("DB_PASSWORD"),
+			}
+			podEnv := []testdata.EnvVar{
+				testdata.EmptyEnv("API_KEY"),
+				testdata.EmptyEnv("DB_PASSWORD"),
+			}
+			manifest := testdata.NewDeploymentAndPodManifest("web", "migrate", deploymentEnv, podEnv)
+			configMap := testdata.NewManifestsConfigMapWithContent(testNamespace, configMapName, manifest)
 			Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
 
 			// Create Stack

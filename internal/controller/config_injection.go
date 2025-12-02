@@ -470,9 +470,8 @@ func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects
 	log := logf.FromContext(ctx)
 	result := &ConfigInjectionResult{}
 
-	if len(mergedVars) == 0 && len(resolvedKeys) == 0 {
-		return result
-	}
+	// Note: We removed the early return here because we ALWAYS need to inject LISSTO_* metadata,
+	// even if there are no variables or secrets to inject
 
 	for _, obj := range objects {
 		// Support both Deployment and Pod
@@ -512,19 +511,54 @@ func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects
 				existingEnv = []interface{}{}
 			}
 
+			// Step 1: Collect existing env var names from container (opt-in approach)
+			// Only variables/secrets that are already declared in the container will be injected
+			existingEnvNames := make(map[string]bool)
+			for _, envVar := range existingEnv {
+				envMap, ok := envVar.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				name, ok := envMap["name"].(string)
+				if !ok {
+					continue
+				}
+				// Don't include reserved variables in the "existing" set
+				// (they'll be handled separately and always injected)
+				if !isReservedEnvVar(name) {
+					existingEnvNames[name] = true
+				}
+			}
+
+			// Step 2: Filter variables - only inject if declared in container
+			filteredVars := make(map[string]string)
+			for key, value := range mergedVars {
+				if existingEnvNames[key] {
+					filteredVars[key] = value
+				}
+			}
+
+			// Step 3: Filter secrets - only inject if declared in container
+			filteredSecrets := make(map[string]secretKeySource)
+			for key, source := range resolvedKeys {
+				if existingEnvNames[key] {
+					filteredSecrets[key] = source
+				}
+			}
+
 			// Build hierarchy: secrets > variables > compose
 			// Secrets have highest priority, so track which keys are secrets
 			secretKeys := make(map[string]bool)
-			for key := range resolvedKeys {
+			for key := range filteredSecrets {
 				secretKeys[key] = true
 			}
 
-			// Build set of all keys that will be injected
+			// Build set of keys that will be injected (filtered set only)
 			keysToInject := make(map[string]bool)
-			for key := range mergedVars {
+			for key := range filteredVars {
 				keysToInject[key] = true
 			}
-			for key := range resolvedKeys {
+			for key := range filteredSecrets {
 				keysToInject[key] = true
 			}
 
@@ -573,8 +607,9 @@ func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects
 			)
 			result.MetadataInjected = 3
 
-			// Add merged variables (these override compose values, but NOT secrets)
-			for key, value := range mergedVars {
+			// Add filtered variables (only those declared in container)
+			// These override compose values, but NOT secrets
+			for key, value := range filteredVars {
 				// Skip if this key is also a secret (secrets have higher priority)
 				if secretKeys[key] {
 					continue
@@ -586,9 +621,10 @@ func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects
 				result.VariablesInjected++
 			}
 
-			// Add secret key refs (these override both compose and variables)
+			// Add filtered secret key refs (only those declared in container)
+			// These override both compose and variables
 			if stackSecretName != "" {
-				for key := range resolvedKeys {
+				for key := range filteredSecrets {
 					filteredEnv = append(filteredEnv, map[string]interface{}{
 						"name": key,
 						"valueFrom": map[string]interface{}{
@@ -615,11 +651,12 @@ func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects
 			result.Warnings = append(result.Warnings,
 				fmt.Sprintf("Failed to update containers in %s %s: %v", resourceKind, resourceName, err))
 		} else {
-			log.Info("Injected config",
+			log.V(1).Info("Injected config into workload",
 				"kind", resourceKind,
 				"name", resourceName,
-				"variables", len(mergedVars),
-				"secrets", len(resolvedKeys))
+				"containers", len(containers),
+				"variablesInjected", result.VariablesInjected,
+				"secretsInjected", result.SecretsInjected)
 		}
 	}
 
