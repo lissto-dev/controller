@@ -1,0 +1,27 @@
+# permissions for editor users to edit lifecycles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: lifecycle-editor-role
+rules:
+- apiGroups:
+  - env.lissto.dev
+  resources:
+  - lifecycles
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - env.lissto.dev
+  resources:
+  - lifecycles/status
+  verbs:
+  - get

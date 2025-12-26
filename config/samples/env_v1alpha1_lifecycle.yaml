@@ -1,0 +1,26 @@
+apiVersion: env.lissto.dev/v1alpha1
+kind: Lifecycle
+metadata:
+  name: cleanup-old-stacks
+spec:
+  targetKind: Stack
+  labelSelector:
+    matchLabels:
+      environment: dev
+  interval: 1h
+  tasks:
+    - name: delete-old-dev-stacks
+      delete:
+        olderThan: 24h
+---
+apiVersion: env.lissto.dev/v1alpha1
+kind: Lifecycle
+metadata:
+  name: cleanup-all-blueprints
+spec:
+  targetKind: Blueprint
+  interval: 6h
+  tasks:
+    - name: delete-stale-blueprints
+      delete:
+        olderThan: 168h  # 7 days
