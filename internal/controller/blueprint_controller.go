@@ -19,8 +19,11 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -38,13 +41,15 @@ const (
 // BlueprintReconciler reconciles a Blueprint object
 type BlueprintReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Config *config.Config
+	Scheme   *runtime.Scheme
+	Config   *config.Config
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=blueprints,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=blueprints/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=blueprints/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=stacks,verbs=list
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -93,6 +98,13 @@ func (r *BlueprintReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				log.Info("Cannot delete Blueprint: referenced by Stacks",
 					"blueprint", blueprint.Name,
 					"stacks", stackNames)
+
+				// Emit event with stack info
+				if r.Recorder != nil {
+					r.Recorder.Eventf(blueprint, corev1.EventTypeWarning, "DeletionBlocked",
+						"Cannot delete Blueprint: referenced by %d Stack(s): %s",
+						len(referencingStacks), strings.Join(stackNames, ", "))
+				}
 
 				// Deletion blocked - lifecycles will handle Stack cleanup
 				return ctrl.Result{}, nil

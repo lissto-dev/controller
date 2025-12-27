@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -25,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -122,6 +124,7 @@ var _ = Describe("Blueprint Controller", func() {
 			globalBlueprint      *envv1alpha1.Blueprint
 			stackInDevNamespace  *envv1alpha1.Stack
 			controllerReconciler *BlueprintReconciler
+			fakeRecorder         *record.FakeRecorder
 		)
 
 		BeforeEach(func() {
@@ -162,10 +165,12 @@ var _ = Describe("Blueprint Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, globalBlueprint)).To(Succeed())
 
+			fakeRecorder = record.NewFakeRecorder(10)
 			controllerReconciler = &BlueprintReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-				Config: testConfig,
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Config:   testConfig,
+				Recorder: fakeRecorder,
 			}
 
 			// Reconcile to add finalizer
@@ -207,7 +212,7 @@ var _ = Describe("Blueprint Controller", func() {
 			}
 		})
 
-		It("should block deletion when Stack in another namespace references global Blueprint", func() {
+		It("should block deletion and emit event when Stack in another namespace references global Blueprint", func() {
 			By("Creating a Stack in dev namespace that references the global Blueprint")
 			stackInDevNamespace = &envv1alpha1.Stack{
 				ObjectMeta: metav1.ObjectMeta{
@@ -249,6 +254,18 @@ var _ = Describe("Blueprint Controller", func() {
 				Namespace: globalBlueprint.Namespace,
 			}, updatedBp)).To(Succeed())
 			Expect(controllerutil.ContainsFinalizer(updatedBp, blueprintFinalizerName)).To(BeTrue())
+
+			By("Verifying a DeletionBlocked event was emitted with stack info")
+			Eventually(func() bool {
+				select {
+				case event := <-fakeRecorder.Events:
+					return event != "" &&
+						strings.Contains(event, "DeletionBlocked") &&
+						strings.Contains(event, "dev-user1/test-stack")
+				default:
+					return false
+				}
+			}, timeout, interval).Should(BeTrue())
 		})
 
 		It("should allow deletion when no Stacks reference the global Blueprint", func() {
