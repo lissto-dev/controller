@@ -105,12 +105,6 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 				return ctrl.Result{}, err
 			}
 
-			// Additional safety net for config secrets that may have been orphaned
-			if err := r.cleanupConfigSecrets(ctx, stack); err != nil {
-				log.Error(err, "Failed to cleanup config secrets")
-				// Don't fail the finalizer, just log the error
-			}
-
 			// Remove finalizer
 			controllerutil.RemoveFinalizer(stack, stackFinalizerName)
 			if err := r.Update(ctx, stack); err != nil {
@@ -764,37 +758,6 @@ func (r *StackReconciler) cleanupStackResources(ctx context.Context, stack *envv
 			"errorCount", errorCount)
 	}
 
-	return nil
-}
-
-// cleanupConfigSecrets cleans up orphaned config secrets that may not have owner references.
-// This is a safety net in case owner references didn't work properly.
-func (r *StackReconciler) cleanupConfigSecrets(ctx context.Context, stack *envv1alpha1.Stack) error {
-	log := logf.FromContext(ctx)
-
-	// Find all secrets with our managed-by label
-	secretList := &corev1.SecretList{}
-	if err := r.List(ctx, secretList,
-		client.InNamespace(stack.Namespace),
-		client.MatchingLabels{
-			"lissto.dev/managed-by": "stack-controller",
-			"lissto.dev/stack":      stack.Name,
-		}); err != nil {
-		return fmt.Errorf("failed to list managed secrets: %w", err)
-	}
-
-	// Delete all managed secrets for this stack
-	for i := range secretList.Items {
-		secret := &secretList.Items[i]
-		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "Failed to delete config secret", "secret", secret.Name)
-			// Continue trying to delete others
-		} else {
-			log.Info("Deleted config secret", "secret", secret.Name)
-		}
-	}
-
-	log.Info("Cleaned up config secrets", "count", len(secretList.Items))
 	return nil
 }
 

@@ -18,12 +18,16 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
@@ -39,7 +43,7 @@ var _ = Describe("Stack Controller", func() {
 
 		typeNamespacedName := types.NamespacedName{
 			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+			Namespace: "default",
 		}
 		stack := &envv1alpha1.Stack{}
 
@@ -119,4 +123,380 @@ var _ = Describe("Stack Controller", func() {
 			Expect(reconciledStack.Finalizers).To(ContainElement("stack.lissto.dev/config-cleanup"))
 		})
 	})
+
+	Context("When cleaning up orphan resources", func() {
+		const stackName = "cleanup-test-stack"
+		const namespace = "default"
+
+		ctx := context.Background()
+
+		typeNamespacedName := types.NamespacedName{
+			Name:      stackName,
+			Namespace: namespace,
+		}
+
+		var controllerReconciler *StackReconciler
+
+		BeforeEach(func() {
+			controllerReconciler = &StackReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+				Config: &config.Config{
+					Namespaces: config.NamespacesConfig{
+						Global: "lissto-global",
+					},
+				},
+			}
+
+			By("creating the required Blueprint")
+			blueprint := testdata.NewBlueprint(namespace, "cleanup-test-blueprint")
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: "cleanup-test-blueprint", Namespace: namespace}, &envv1alpha1.Blueprint{})
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
+			}
+
+			By("creating the required ConfigMap")
+			configMap := testdata.NewManifestsConfigMap(namespace, "cleanup-test-manifests")
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "cleanup-test-manifests", Namespace: namespace}, &corev1.ConfigMap{})
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
+			}
+		})
+
+		AfterEach(func() {
+			By("Cleanup test resources")
+
+			// Delete Stack if it exists
+			stack := &envv1alpha1.Stack{}
+			err := k8sClient.Get(ctx, typeNamespacedName, stack)
+			if err == nil {
+				_ = k8sClient.Delete(ctx, stack)
+			}
+
+			// Delete ConfigMap
+			cm := &corev1.ConfigMap{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "cleanup-test-manifests", Namespace: namespace}, cm)
+			if err == nil {
+				_ = k8sClient.Delete(ctx, cm)
+			}
+
+			// Delete Blueprint
+			bp := &envv1alpha1.Blueprint{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "cleanup-test-blueprint", Namespace: namespace}, bp)
+			if err == nil {
+				_ = k8sClient.Delete(ctx, bp)
+			}
+
+			// Clean up any orphan resources that might be left
+			cleanupOrphanResources(ctx, namespace, stackName)
+		})
+
+		It("should cleanup orphan secrets with lissto.dev/stack label", func() {
+			By("Creating a Stack and reconciling it")
+			stack := testdata.NewStack(namespace, stackName, "default/cleanup-test-blueprint", "cleanup-test-manifests")
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Reconcile to add finalizer
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Get the stack to have its UID
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
+
+			By("Creating an orphan secret with lissto.dev/stack label but no owner reference")
+			orphanSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      stackName + "-orphan-secret",
+					Namespace: namespace,
+					Labels: map[string]string{
+						"lissto.dev/stack":      stackName,
+						"lissto.dev/managed-by": "stack-controller",
+					},
+				},
+				Data: map[string][]byte{
+					"test-key": []byte("test-value"),
+				},
+			}
+			Expect(k8sClient.Create(ctx, orphanSecret)).To(Succeed())
+
+			// Verify the orphan secret exists
+			createdSecret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: orphanSecret.Name, Namespace: namespace}, createdSecret)).To(Succeed())
+
+			By("Deleting the Stack")
+			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
+
+			By("Reconciling to trigger cleanup")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the orphan secret was cleaned up")
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: orphanSecret.Name, Namespace: namespace}, &corev1.Secret{})
+				return errors.IsNotFound(err)
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "Orphan secret should be deleted")
+		})
+
+		It("should cleanup orphan services with lissto.dev/stack label", func() {
+			By("Creating a Stack and reconciling it")
+			stack := testdata.NewStack(namespace, stackName, "default/cleanup-test-blueprint", "cleanup-test-manifests")
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Reconcile to add finalizer
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Get the stack to have its UID
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
+
+			By("Creating an orphan service with lissto.dev/stack label but no owner reference")
+			orphanService := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      stackName + "-orphan-service",
+					Namespace: namespace,
+					Labels: map[string]string{
+						"lissto.dev/stack": stackName,
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{
+						{Port: 80, Protocol: corev1.ProtocolTCP},
+					},
+					Selector: map[string]string{
+						"app": "test",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, orphanService)).To(Succeed())
+
+			// Verify the orphan service exists
+			createdService := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: orphanService.Name, Namespace: namespace}, createdService)).To(Succeed())
+
+			By("Deleting the Stack")
+			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
+
+			By("Reconciling to trigger cleanup")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the orphan service was cleaned up")
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: orphanService.Name, Namespace: namespace}, &corev1.Service{})
+				return errors.IsNotFound(err)
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "Orphan service should be deleted")
+		})
+
+		It("should cleanup multiple orphan resources of different types", func() {
+			By("Creating a Stack and reconciling it")
+			stack := testdata.NewStack(namespace, stackName, "default/cleanup-test-blueprint", "cleanup-test-manifests")
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Reconcile to add finalizer
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Get the stack to have its UID
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
+
+			By("Creating orphan resources with lissto.dev/stack label but no owner reference")
+
+			// Orphan Secret
+			orphanSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      stackName + "-multi-orphan-secret",
+					Namespace: namespace,
+					Labels: map[string]string{
+						"lissto.dev/stack":      stackName,
+						"lissto.dev/managed-by": "stack-controller",
+					},
+				},
+				Data: map[string][]byte{"key": []byte("value")},
+			}
+			Expect(k8sClient.Create(ctx, orphanSecret)).To(Succeed())
+
+			// Orphan Service
+			orphanService := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      stackName + "-multi-orphan-service",
+					Namespace: namespace,
+					Labels: map[string]string{
+						"lissto.dev/stack": stackName,
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Ports:    []corev1.ServicePort{{Port: 8080, Protocol: corev1.ProtocolTCP}},
+					Selector: map[string]string{"app": "test"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, orphanService)).To(Succeed())
+
+			// Orphan ConfigMap (instead of PVC which has issues in envtest)
+			orphanConfigMap := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      stackName + "-multi-orphan-configmap",
+					Namespace: namespace,
+					Labels: map[string]string{
+						"lissto.dev/stack": stackName,
+					},
+				},
+				Data: map[string]string{"key": "value"},
+			}
+			Expect(k8sClient.Create(ctx, orphanConfigMap)).To(Succeed())
+
+			// Verify all orphan resources exist
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: orphanSecret.Name, Namespace: namespace}, &corev1.Secret{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: orphanService.Name, Namespace: namespace}, &corev1.Service{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: orphanConfigMap.Name, Namespace: namespace}, &corev1.ConfigMap{})).To(Succeed())
+
+			By("Deleting the Stack")
+			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
+
+			By("Reconciling to trigger cleanup")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying orphan secret and service were cleaned up")
+			// Note: ConfigMap is not in the cleanup list, so it won't be deleted
+			Eventually(func() bool {
+				secretErr := k8sClient.Get(ctx, types.NamespacedName{Name: orphanSecret.Name, Namespace: namespace}, &corev1.Secret{})
+				serviceErr := k8sClient.Get(ctx, types.NamespacedName{Name: orphanService.Name, Namespace: namespace}, &corev1.Service{})
+				return errors.IsNotFound(secretErr) && errors.IsNotFound(serviceErr)
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "Orphan secret and service should be deleted")
+
+			// Cleanup the ConfigMap manually (it's not in the cleanup list)
+			_ = k8sClient.Delete(ctx, orphanConfigMap)
+		})
+
+		It("should not cleanup resources belonging to other stacks", func() {
+			By("Creating a Stack and reconciling it")
+			stack := testdata.NewStack(namespace, stackName, "default/cleanup-test-blueprint", "cleanup-test-manifests")
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Reconcile to add finalizer
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Creating a secret belonging to a different stack")
+			otherStackSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "other-stack-secret",
+					Namespace: namespace,
+					Labels: map[string]string{
+						"lissto.dev/stack":      "other-stack-name",
+						"lissto.dev/managed-by": "stack-controller",
+					},
+				},
+				Data: map[string][]byte{"key": []byte("value")},
+			}
+			Expect(k8sClient.Create(ctx, otherStackSecret)).To(Succeed())
+
+			By("Deleting the Stack")
+			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
+
+			By("Reconciling to trigger cleanup")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the other stack's secret was NOT deleted")
+			Consistently(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: otherStackSecret.Name, Namespace: namespace}, &corev1.Secret{})
+			}, 2*time.Second, 100*time.Millisecond).Should(Succeed(), "Other stack's secret should NOT be deleted")
+
+			// Cleanup the other stack's secret
+			_ = k8sClient.Delete(ctx, otherStackSecret)
+		})
+
+		It("should cleanup resources with owner reference to the stack", func() {
+			By("Creating a Stack and reconciling it")
+			stack := testdata.NewStack(namespace, stackName, "default/cleanup-test-blueprint", "cleanup-test-manifests")
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Reconcile to add finalizer
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Get the stack to have its UID
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
+
+			By("Creating a secret with owner reference to the stack")
+			ownedSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      stackName + "-owned-secret",
+					Namespace: namespace,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "env.lissto.dev/v1alpha1",
+							Kind:       "Stack",
+							Name:       stack.Name,
+							UID:        stack.UID,
+						},
+					},
+				},
+				Data: map[string][]byte{"key": []byte("value")},
+			}
+			Expect(k8sClient.Create(ctx, ownedSecret)).To(Succeed())
+
+			// Verify the owned secret exists
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ownedSecret.Name, Namespace: namespace}, &corev1.Secret{})).To(Succeed())
+
+			By("Deleting the Stack")
+			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
+
+			By("Reconciling to trigger cleanup")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the owned secret was cleaned up")
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: ownedSecret.Name, Namespace: namespace}, &corev1.Secret{})
+				return errors.IsNotFound(err)
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "Owned secret should be deleted")
+		})
+	})
 })
+
+// Helper function to cleanup orphan resources after tests
+func cleanupOrphanResources(ctx context.Context, namespace, stackName string) {
+	listOpts := client.InNamespace(namespace)
+
+	// Cleanup secrets
+	secretList := &corev1.SecretList{}
+	_ = k8sClient.List(ctx, secretList, listOpts)
+	for i := range secretList.Items {
+		secret := &secretList.Items[i]
+		if labels := secret.GetLabels(); labels != nil && labels["lissto.dev/stack"] == stackName {
+			_ = k8sClient.Delete(ctx, secret)
+		}
+	}
+
+	// Cleanup services
+	serviceList := &corev1.ServiceList{}
+	_ = k8sClient.List(ctx, serviceList, listOpts)
+	for i := range serviceList.Items {
+		svc := &serviceList.Items[i]
+		if labels := svc.GetLabels(); labels != nil && labels["lissto.dev/stack"] == stackName {
+			_ = k8sClient.Delete(ctx, svc)
+		}
+	}
+
+	// Cleanup PVCs
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	_ = k8sClient.List(ctx, pvcList, listOpts)
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if labels := pvc.GetLabels(); labels != nil && labels["lissto.dev/stack"] == stackName {
+			_ = k8sClient.Delete(ctx, pvc)
+		}
+	}
+
+	// Cleanup deployments
+	deploymentList := &appsv1.DeploymentList{}
+	_ = k8sClient.List(ctx, deploymentList, listOpts)
+	for i := range deploymentList.Items {
+		dep := &deploymentList.Items[i]
+		if labels := dep.GetLabels(); labels != nil && labels["lissto.dev/stack"] == stackName {
+			_ = k8sClient.Delete(ctx, dep)
+		}
+	}
+}
