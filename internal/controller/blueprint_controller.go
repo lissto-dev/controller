@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -95,8 +94,8 @@ func (r *BlueprintReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					"blueprint", blueprint.Name,
 					"stacks", stackNames)
 
-				// Requeue to check again later
-				return ctrl.Result{RequeueAfter: 30000000000}, nil // 30 seconds
+				// Deletion blocked - lifecycles will handle Stack cleanup
+				return ctrl.Result{}, nil
 			}
 
 			// No referencing Stacks, safe to delete - remove finalizer
@@ -166,14 +165,6 @@ func (r *BlueprintReconciler) isGlobalNamespace(namespace string) bool {
 		return false
 	}
 	return namespace == r.Config.Namespaces.Global
-}
-
-// isDeveloperNamespace checks if the given namespace is a developer namespace (by prefix)
-func (r *BlueprintReconciler) isDeveloperNamespace(namespace string) bool {
-	if r.Config == nil {
-		return false
-	}
-	return strings.HasPrefix(namespace, r.Config.Namespaces.DeveloperPrefix)
 }
 
 // stackReferencesBlueprint checks if a Stack references the given Blueprint

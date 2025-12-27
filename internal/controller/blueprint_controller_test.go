@@ -234,14 +234,13 @@ var _ = Describe("Blueprint Controller", func() {
 			Expect(k8sClient.Delete(ctx, bp)).To(Succeed())
 
 			By("Reconciling the Blueprint deletion")
-			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      globalBlueprint.Name,
 					Namespace: globalBlueprint.Namespace,
 				},
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeNumerically(">", 0), "Should requeue when deletion is blocked")
 
 			By("Verifying the Blueprint still exists with finalizer")
 			updatedBp := &envv1alpha1.Blueprint{}
@@ -408,14 +407,13 @@ var _ = Describe("Blueprint Controller", func() {
 			Expect(k8sClient.Delete(ctx, bp)).To(Succeed())
 
 			By("Reconciling the Blueprint deletion")
-			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      devBlueprint.Name,
 					Namespace: devBlueprint.Namespace,
 				},
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeNumerically(">", 0), "Should requeue when deletion is blocked")
 
 			By("Verifying the Blueprint still exists with finalizer")
 			updatedBp := &envv1alpha1.Blueprint{}
@@ -494,17 +492,6 @@ var _ = Describe("Blueprint Controller", func() {
 			Expect(reconciler.isGlobalNamespace("lissto-global")).To(BeTrue())
 			Expect(reconciler.isGlobalNamespace("dev-user1")).To(BeFalse())
 			Expect(reconciler.isGlobalNamespace("default")).To(BeFalse())
-		})
-
-		It("should correctly identify developer namespace", func() {
-			reconciler := &BlueprintReconciler{
-				Config: testConfig,
-			}
-
-			Expect(reconciler.isDeveloperNamespace("dev-user1")).To(BeTrue())
-			Expect(reconciler.isDeveloperNamespace("dev-")).To(BeTrue())
-			Expect(reconciler.isDeveloperNamespace("lissto-global")).To(BeFalse())
-			Expect(reconciler.isDeveloperNamespace("default")).To(BeFalse())
 		})
 
 		It("should correctly check if stack references blueprint", func() {
