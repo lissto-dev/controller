@@ -39,6 +39,16 @@ type NamespacesConfig struct {
 	DeveloperPrefix string `yaml:"developerPrefix"`
 }
 
+// IsGlobalNamespace checks if a namespace is the global namespace
+func (nc *NamespacesConfig) IsGlobalNamespace(namespace string) bool {
+	return namespace == nc.Global
+}
+
+// IsDeveloperNamespace checks if a namespace is a developer namespace
+func (nc *NamespacesConfig) IsDeveloperNamespace(namespace string) bool {
+	return strings.HasPrefix(namespace, nc.DeveloperPrefix)
+}
+
 // RepoConfig holds repository configuration
 type RepoConfig struct {
 	URL      string   `yaml:"url"`
