@@ -22,9 +22,9 @@ import (
 
 // LifecycleSpec defines the desired state of Lifecycle
 type LifecycleSpec struct {
-	// TargetKind specifies the kind of objects to manage (e.g., "Stack", "Blueprint")
+	// TargetKind specifies the kind of objects to manage (e.g., "Stack", "Blueprint", "VolumeSnapshot")
 	// +required
-	// +kubebuilder:validation:Enum=Stack;Blueprint
+	// +kubebuilder:validation:Enum=Stack;Blueprint;VolumeSnapshot
 	TargetKind string `json:"targetKind"`
 
 	// LabelSelector optionally filters objects by labels.
@@ -52,6 +52,21 @@ type LifecycleTask struct {
 	// Delete removes objects older than specified duration
 	// +optional
 	Delete *DeleteTask `json:"delete,omitempty"`
+
+	// ScaleDown scales deployments/statefulsets to 0 replicas
+	// Used before snapshot to release volume locks
+	// +optional
+	ScaleDown *ScaleDownTask `json:"scaleDown,omitempty"`
+
+	// ScaleUp restores deployments/statefulsets to their original replica counts
+	// Used after snapshot to resume workloads
+	// +optional
+	ScaleUp *ScaleUpTask `json:"scaleUp,omitempty"`
+
+	// Snapshot creates volume snapshots for matching stacks
+	// Uploads volume data to object storage
+	// +optional
+	Snapshot *SnapshotTask `json:"snapshot,omitempty"`
 }
 
 // DeleteTask configures automatic deletion of objects based on age
@@ -61,6 +76,28 @@ type DeleteTask struct {
 	// Examples: "30m", "2h", "24h", "7d"
 	// +required
 	OlderThan metav1.Duration `json:"olderThan"`
+}
+
+// ScaleDownTask configures scaling down of workloads
+type ScaleDownTask struct {
+	// Timeout specifies how long to wait for pods to terminate
+	// Default: 5m
+	// +optional
+	Timeout metav1.Duration `json:"timeout,omitempty"`
+}
+
+// ScaleUpTask configures scaling up of workloads to original replicas
+type ScaleUpTask struct {
+	// Empty struct - restores original replica counts stored during scale down
+}
+
+// SnapshotTask configures volume snapshot creation
+type SnapshotTask struct {
+	// Empty struct - uses controller config and conventions
+	// - Storage config from controller config
+	// - Credentials from lissto-object-storage secret
+	// - Path: {user}/{env}/{repo-hash}/{service}/{mountPath-hash}/{id}.tar.gz
+	// - Compression: always gzip
 }
 
 // LifecycleStatus defines the observed state of Lifecycle
