@@ -488,8 +488,14 @@ var _ = Describe("Lifecycle Integration Tests", func() {
 			}
 			Expect(k8sClient.Create(ctx, lifecycle)).To(Succeed())
 
-			// Trigger reconciliation to start worker
+			// Trigger first reconciliation to add finalizer
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-deletion-lifecycle"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Trigger second reconciliation to start worker
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: "test-deletion-lifecycle"},
 			})
 			Expect(err).NotTo(HaveOccurred())
@@ -592,6 +598,79 @@ var _ = Describe("Lifecycle Integration Tests", func() {
 
 			// Cleanup
 			_ = k8sClient.Delete(ctx, lifecycle)
+		})
+	})
+
+	Context("Worker Execution Behavior", func() {
+		It("should not run concurrent executions when tasks exceed interval", func() {
+			// Create a Lifecycle with very short interval
+			lifecycle := &envv1alpha1.Lifecycle{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-non-blocking-lifecycle",
+				},
+				Spec: envv1alpha1.LifecycleSpec{
+					TargetKind: "Stack",
+					Interval:   metav1.Duration{Duration: 50 * time.Millisecond},
+					Tasks: []envv1alpha1.LifecycleTask{
+						{
+							Name: "quick-check",
+							Delete: &envv1alpha1.DeleteTask{
+								OlderThan: metav1.Duration{Duration: 24 * time.Hour},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, lifecycle)).To(Succeed())
+
+			// Trigger first reconciliation to add finalizer
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-non-blocking-lifecycle"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Trigger second reconciliation to start worker
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-non-blocking-lifecycle"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify worker is running
+			reconciler.mu.Lock()
+			_, workerExists := reconciler.workers["test-non-blocking-lifecycle"]
+			reconciler.mu.Unlock()
+			Expect(workerExists).To(BeTrue(), "Worker should be running")
+
+			// Wait for a few ticks to occur
+			time.Sleep(200 * time.Millisecond)
+
+			// Verify the worker is still registered (not blocked or crashed)
+			reconciler.mu.Lock()
+			_, stillExists := reconciler.workers["test-non-blocking-lifecycle"]
+			reconciler.mu.Unlock()
+			Expect(stillExists).To(BeTrue(), "Worker should still be running")
+
+			// Delete Lifecycle and verify quick shutdown
+			Expect(k8sClient.Delete(ctx, lifecycle)).To(Succeed())
+
+			start := time.Now()
+			Eventually(func() bool {
+				_, err := reconciler.Reconcile(ctx, reconcile.Request{
+					NamespacedName: types.NamespacedName{Name: "test-non-blocking-lifecycle"},
+				})
+				if err != nil {
+					return false
+				}
+				reconciler.mu.Lock()
+				_, exists := reconciler.workers["test-non-blocking-lifecycle"]
+				reconciler.mu.Unlock()
+				return !exists
+			}, 2*time.Second, 50*time.Millisecond).Should(BeTrue(),
+				"Worker should be stopped quickly")
+
+			shutdownTime := time.Since(start)
+			Expect(shutdownTime).To(BeNumerically("<", 1*time.Second),
+				"Shutdown should be fast (not blocked by task execution)")
 		})
 	})
 })
