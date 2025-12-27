@@ -13,7 +13,7 @@ func parseManifests(manifestsYAML string) ([]*unstructured.Unstructured, error) 
 	// Split by YAML document separator
 	docs := strings.Split(manifestsYAML, "---\n")
 
-	var objects []*unstructured.Unstructured
+	objects := make([]*unstructured.Unstructured, 0, len(docs))
 	for i, doc := range docs {
 		doc = strings.TrimSpace(doc)
 		if doc == "" {

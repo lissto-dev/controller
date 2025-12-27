@@ -33,6 +33,8 @@ import (
 	"github.com/lissto-dev/controller/pkg/config"
 )
 
+const testEnvStaging = "staging"
+
 var _ = Describe("Config Injection Hierarchy Tests", func() {
 	var (
 		testNamespace   string
@@ -108,7 +110,7 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			Expect(k8sClient.Create(ctx, repoVar)).To(Succeed())
 
 			// Create env-scoped variable
-			envVar := testdata.NewEnvScopedVariable(testNamespace, "env-vars", "staging", map[string]string{
+			envVar := testdata.NewEnvScopedVariable(testNamespace, "env-vars", testEnvStaging, map[string]string{
 				"VAR1": "env",
 			})
 			Expect(k8sClient.Create(ctx, envVar)).To(Succeed())
@@ -116,7 +118,7 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			// Create Stack
 			stack := testdata.NewStack(testNamespace, "test-stack",
 				fmt.Sprintf("%s/test-blueprint", testNamespace), "test-manifests")
-			stack.Spec.Env = "staging"
+			stack.Spec.Env = testEnvStaging
 			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
 
 			// Trigger reconciliation
@@ -345,13 +347,13 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 			repoSecret := testdata.NewRepoScopedSecret(testNamespace, "repo-secrets", "myorg/myapp", []string{"KEY1", "KEY2"}, "repo-secrets-data")
 			Expect(k8sClient.Create(ctx, repoSecret)).To(Succeed())
 
-			envSecret := testdata.NewEnvScopedSecret(testNamespace, "env-secrets", "staging", []string{"KEY1"}, "env-secrets-data")
+			envSecret := testdata.NewEnvScopedSecret(testNamespace, "env-secrets", testEnvStaging, []string{"KEY1"}, "env-secrets-data")
 			Expect(k8sClient.Create(ctx, envSecret)).To(Succeed())
 
 			// Create Stack
 			stack := testdata.NewStack(testNamespace, "test-stack",
 				fmt.Sprintf("%s/test-blueprint", testNamespace), "test-manifests")
-			stack.Spec.Env = "staging"
+			stack.Spec.Env = testEnvStaging
 			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
 
 			// Trigger reconciliation
