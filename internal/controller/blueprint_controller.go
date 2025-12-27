@@ -64,7 +64,7 @@ func (r *BlueprintReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	log.Info("Reconciling Blueprint", "name", blueprint.Name, "namespace", blueprint.Namespace)
 
 	// Handle finalizer for deletion protection
-	if blueprint.ObjectMeta.DeletionTimestamp.IsZero() {
+	if blueprint.DeletionTimestamp.IsZero() {
 		// Blueprint is not being deleted, ensure finalizer is present
 		if !controllerutil.ContainsFinalizer(blueprint, blueprintFinalizerName) {
 			controllerutil.AddFinalizer(blueprint, blueprintFinalizerName)
@@ -121,7 +121,11 @@ func (r *BlueprintReconciler) findReferencingStacks(ctx context.Context, bluepri
 
 	var referencingStacks []envv1alpha1.Stack
 
-	isGlobalBlueprint := r.isGlobalNamespace(blueprint.Namespace)
+	if r.Config == nil {
+		return nil, fmt.Errorf("config is not set")
+	}
+
+	isGlobalBlueprint := r.Config.Namespaces.IsGlobalNamespace(blueprint.Namespace)
 
 	if isGlobalBlueprint {
 		// Global Blueprint: search ALL namespaces
@@ -157,14 +161,6 @@ func (r *BlueprintReconciler) findReferencingStacks(ctx context.Context, bluepri
 	}
 
 	return referencingStacks, nil
-}
-
-// isGlobalNamespace checks if the given namespace is the global namespace
-func (r *BlueprintReconciler) isGlobalNamespace(namespace string) bool {
-	if r.Config == nil {
-		return false
-	}
-	return namespace == r.Config.Namespaces.Global
 }
 
 // stackReferencesBlueprint checks if a Stack references the given Blueprint

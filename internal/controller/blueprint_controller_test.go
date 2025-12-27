@@ -484,14 +484,17 @@ var _ = Describe("Blueprint Controller", func() {
 	})
 
 	Context("Helper function tests", func() {
-		It("should correctly identify global namespace", func() {
-			reconciler := &BlueprintReconciler{
-				Config: testConfig,
-			}
+		It("should correctly identify global namespace using config helper", func() {
+			Expect(testConfig.Namespaces.IsGlobalNamespace("lissto-global")).To(BeTrue())
+			Expect(testConfig.Namespaces.IsGlobalNamespace("dev-user1")).To(BeFalse())
+			Expect(testConfig.Namespaces.IsGlobalNamespace("default")).To(BeFalse())
+		})
 
-			Expect(reconciler.isGlobalNamespace("lissto-global")).To(BeTrue())
-			Expect(reconciler.isGlobalNamespace("dev-user1")).To(BeFalse())
-			Expect(reconciler.isGlobalNamespace("default")).To(BeFalse())
+		It("should correctly identify developer namespace using config helper", func() {
+			Expect(testConfig.Namespaces.IsDeveloperNamespace("dev-user1")).To(BeTrue())
+			Expect(testConfig.Namespaces.IsDeveloperNamespace("dev-")).To(BeTrue())
+			Expect(testConfig.Namespaces.IsDeveloperNamespace("lissto-global")).To(BeFalse())
+			Expect(testConfig.Namespaces.IsDeveloperNamespace("default")).To(BeFalse())
 		})
 
 		It("should correctly check if stack references blueprint", func() {
