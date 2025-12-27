@@ -310,7 +310,7 @@ func (r *LifecycleReconciler) executeDeleteTask(ctx context.Context, lifecycle *
 			if stack.CreationTimestamp.Time.Before(threshold) {
 				log.Info("Deleting Stack", "name", stack.Name, "namespace", stack.Namespace, "age", now.Sub(stack.CreationTimestamp.Time))
 				if err := r.Delete(ctx, stack); err != nil {
-					errs = append(errs, fmt.Errorf("Stack %s/%s: %w", stack.Namespace, stack.Name, err))
+					errs = append(errs, fmt.Errorf("stack %s/%s: %w", stack.Namespace, stack.Name, err))
 				} else {
 					deleted++
 				}
@@ -329,7 +329,7 @@ func (r *LifecycleReconciler) executeDeleteTask(ctx context.Context, lifecycle *
 			if blueprint.CreationTimestamp.Time.Before(threshold) {
 				log.Info("Deleting Blueprint", "name", blueprint.Name, "namespace", blueprint.Namespace, "age", now.Sub(blueprint.CreationTimestamp.Time))
 				if err := r.Delete(ctx, blueprint); err != nil {
-					errs = append(errs, fmt.Errorf("Blueprint %s/%s: %w", blueprint.Namespace, blueprint.Name, err))
+					errs = append(errs, fmt.Errorf("blueprint %s/%s: %w", blueprint.Namespace, blueprint.Name, err))
 				} else {
 					deleted++
 				}
