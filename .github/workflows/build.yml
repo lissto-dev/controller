@@ -2,7 +2,7 @@ name: Build and Push Controller
 
 on:
   workflow_run:
-    workflows: ["CI - Lint, Test & Integration Tests"]
+    workflows: ["CI"]
     types:
       - completed
     branches:
