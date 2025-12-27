@@ -44,10 +44,6 @@ jobs:
       - name: Extract metadata
         id: meta
         run: |
-          # Get short commit SHA
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-          
           # Determine if this is a tag build
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG_NAME=${GITHUB_REF#refs/tags/}
@@ -72,7 +68,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ steps.meta.outputs.is_tag == 'true' && format('{0}:{1}', env.IMAGE_NAME, steps.meta.outputs.tag_name) || format('{0}:{1}', env.IMAGE_NAME, steps.meta.outputs.short_sha) }}
+            ${{ steps.meta.outputs.is_tag == 'true' && format('{0}:{1}', env.IMAGE_NAME, steps.meta.outputs.tag_name) || format('{0}:main', env.IMAGE_NAME) }}
             ${{ steps.meta.outputs.is_stable == 'true' && format('{0}:latest', env.IMAGE_NAME) || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -82,7 +78,7 @@ jobs:
           if [[ "${{ steps.meta.outputs.is_tag }}" == "true" ]]; then
             TAG="${{ steps.meta.outputs.tag_name }}"
           else
-            TAG="${{ steps.meta.outputs.short_sha }}"
+            TAG="main"
           fi
           echo "Image Tag: $TAG"
           echo "Is Stable Release: ${{ steps.meta.outputs.is_stable }}"
