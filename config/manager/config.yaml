@@ -8,22 +8,25 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
 data:
   config.yaml: |
-    apiServer:
-      url: "http://lissto-api:8080"
-      timeout: 30s
-    features:
-      enableAutoReconcile: true
-      enableWebhooks: false
-    reconciliation:
-      maxConcurrent: 5
-      requeueAfter: 5m
+    api:
+      server:
+        url: "http://lissto-api:8080"
     logging:
       level: info
-      format: json
     namespaces:
       global: "lissto-global"
       developerPrefix: "dev-"
-      globalBranches:
-        - main
-        - master
+    repos:
+      main:
+        url: "https://github.com/example/repo"
+        name: "Main Repository"
+        branches:
+          - main
+          - master
+    stacks:
+      ingress:
+        internal:
+          ingressClass: "nginx"
+          hostSuffix: ".internal.example.com"
+          tlsSecret: "wildcard-internal-tls"
 

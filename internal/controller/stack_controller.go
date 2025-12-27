@@ -40,9 +40,7 @@ import (
 	"github.com/lissto-dev/controller/pkg/config"
 )
 
-const (
-	stackFinalizerName = "stack.lissto.dev/config-cleanup"
-)
+const stackFinalizerName = "stack.lissto.dev/config-cleanup"
 
 // StackReconciler reconciles a Stack object
 type StackReconciler struct {
@@ -87,7 +85,7 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	log.Info("Reconciling Stack", "name", stack.Name, "namespace", stack.Namespace)
 
 	// Handle finalizer for cleanup
-	if stack.ObjectMeta.DeletionTimestamp.IsZero() {
+	if stack.DeletionTimestamp.IsZero() {
 		// Stack is not being deleted, ensure finalizer is present
 		if !controllerutil.ContainsFinalizer(stack, stackFinalizerName) {
 			controllerutil.AddFinalizer(stack, stackFinalizerName)
@@ -253,7 +251,7 @@ func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructu
 
 	for _, obj := range objects {
 		// Support both Deployment and Pod
-		if obj.GetKind() != "Deployment" && obj.GetKind() != "Pod" {
+		if obj.GetKind() != kindDeployment && obj.GetKind() != kindPod {
 			continue
 		}
 
@@ -262,7 +260,7 @@ func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructu
 
 		// Get containers path based on resource type
 		var containersPath []string
-		if resourceKind == "Deployment" {
+		if resourceKind == kindDeployment {
 			containersPath = []string{"spec", "template", "spec", "containers"}
 		} else { // Pod
 			containersPath = []string{"spec", "containers"}
@@ -657,6 +655,10 @@ func (r *StackReconciler) updateStackStatus(ctx context.Context, stack *envv1alp
 
 // cleanupStackResources performs comprehensive cleanup of all Stack resources
 // This acts as a safety net in case owner references didn't work properly
+// cleanupStackResources cleans up resources owned by the Stack during deletion.
+// It intentionally returns nil even on partial failures to allow Stack deletion to proceed.
+//
+//nolint:unparam // error return is kept for interface consistency and future use
 func (r *StackReconciler) cleanupStackResources(ctx context.Context, stack *envv1alpha1.Stack) error {
 	log := logf.FromContext(ctx)
 
@@ -761,37 +763,6 @@ func (r *StackReconciler) cleanupStackResources(ctx context.Context, stack *envv
 			"errorCount", errorCount)
 	}
 
-	return nil
-}
-
-// cleanupConfigSecrets cleans up orphaned config secrets that may not have owner references
-// Deprecated: Use cleanupStackResources instead
-func (r *StackReconciler) cleanupConfigSecrets(ctx context.Context, stack *envv1alpha1.Stack) error {
-	log := logf.FromContext(ctx)
-
-	// Find all secrets with our managed-by label
-	secretList := &corev1.SecretList{}
-	if err := r.List(ctx, secretList,
-		client.InNamespace(stack.Namespace),
-		client.MatchingLabels{
-			"lissto.dev/managed-by": "stack-controller",
-			"lissto.dev/stack":      stack.Name,
-		}); err != nil {
-		return fmt.Errorf("failed to list managed secrets: %w", err)
-	}
-
-	// Delete all managed secrets for this stack
-	for i := range secretList.Items {
-		secret := &secretList.Items[i]
-		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "Failed to delete config secret", "secret", secret.Name)
-			// Continue trying to delete others
-		} else {
-			log.Info("Deleted config secret", "secret", secret.Name)
-		}
-	}
-
-	log.Info("Cleaned up config secrets", "count", len(secretList.Items))
 	return nil
 }
 

@@ -38,6 +38,19 @@ import (
 // These are injected by the controller and override any user values
 const ReservedEnvPrefix = "LISSTO_"
 
+// Config scope constants for variable/secret hierarchy
+const (
+	scopeEnv    = "env"
+	scopeRepo   = "repo"
+	scopeGlobal = "global"
+)
+
+// Kubernetes resource kinds
+const (
+	kindDeployment = "Deployment"
+	kindPod        = "Pod"
+)
+
 // isReservedEnvVar checks if an env var name is reserved
 // Any variable starting with LISSTO_ is considered reserved
 func isReservedEnvVar(name string) bool {
@@ -85,11 +98,11 @@ func extractStackMetadata(stack *envv1alpha1.Stack) StackMetadata {
 // scopePriority returns the priority of a scope (lower = higher priority)
 func scopePriority(scope string) int {
 	switch scope {
-	case "env":
+	case scopeEnv:
 		return 1
-	case "repo":
+	case scopeRepo:
 		return 2
-	case "global":
+	case scopeGlobal:
 		return 3
 	default:
 		return 99
@@ -464,33 +477,133 @@ func (r *StackReconciler) copySecretsToStackNamespace(ctx context.Context, stack
 	return stackSecret, missingKeys, nil
 }
 
+// collectExistingEnvNames extracts non-reserved env var names from a container
+func collectExistingEnvNames(existingEnv []interface{}) map[string]bool {
+	names := make(map[string]bool)
+	for _, envVar := range existingEnv {
+		envMap, ok := envVar.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, ok := envMap["name"].(string)
+		if !ok {
+			continue
+		}
+		if !isReservedEnvVar(name) {
+			names[name] = true
+		}
+	}
+	return names
+}
+
+// filterEnvByDeclared filters variables/secrets to only those declared in container
+func filterEnvByDeclared(mergedVars map[string]string, resolvedKeys map[string]secretKeySource,
+	existingEnvNames map[string]bool) (map[string]string, map[string]secretKeySource) {
+	filteredVars := make(map[string]string)
+	for key, value := range mergedVars {
+		if existingEnvNames[key] {
+			filteredVars[key] = value
+		}
+	}
+
+	filteredSecrets := make(map[string]secretKeySource)
+	for key, source := range resolvedKeys {
+		if existingEnvNames[key] {
+			filteredSecrets[key] = source
+		}
+	}
+	return filteredVars, filteredSecrets
+}
+
+// buildInjectionEnv builds the final env var list with proper hierarchy
+func buildInjectionEnv(existingEnv []interface{}, filteredVars map[string]string,
+	filteredSecrets map[string]secretKeySource, stackSecretName string, metadata StackMetadata,
+	result *ConfigInjectionResult) []interface{} {
+	// Build set of secret keys (highest priority)
+	secretKeys := make(map[string]bool)
+	for key := range filteredSecrets {
+		secretKeys[key] = true
+	}
+
+	// Build set of all keys to inject
+	keysToInject := make(map[string]bool)
+	for key := range filteredVars {
+		keysToInject[key] = true
+	}
+	for key := range filteredSecrets {
+		keysToInject[key] = true
+	}
+
+	// Filter existing env vars (remove conflicts and reserved)
+	filteredEnv := make([]interface{}, 0, len(existingEnv)+len(filteredVars)+len(filteredSecrets)+3)
+	for _, envVar := range existingEnv {
+		envMap, ok := envVar.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, ok := envMap["name"].(string)
+		if !ok || isReservedEnvVar(name) || keysToInject[name] {
+			continue
+		}
+		filteredEnv = append(filteredEnv, envVar)
+	}
+
+	// Inject reserved metadata (always injected)
+	filteredEnv = append(filteredEnv,
+		map[string]interface{}{"name": "LISSTO_ENV", "value": metadata.Env},
+		map[string]interface{}{"name": "LISSTO_STACK", "value": metadata.StackName},
+		map[string]interface{}{"name": "LISSTO_USER", "value": metadata.User},
+	)
+	result.MetadataInjected = 3
+
+	// Add variables (skip if also a secret)
+	for key, value := range filteredVars {
+		if secretKeys[key] {
+			continue
+		}
+		filteredEnv = append(filteredEnv, map[string]interface{}{"name": key, "value": value})
+		result.VariablesInjected++
+	}
+
+	// Add secret refs
+	if stackSecretName != "" {
+		for key := range filteredSecrets {
+			filteredEnv = append(filteredEnv, map[string]interface{}{
+				"name": key,
+				"valueFrom": map[string]interface{}{
+					"secretKeyRef": map[string]interface{}{"name": stackSecretName, "key": key},
+				},
+			})
+			result.SecretsInjected++
+		}
+	}
+
+	return filteredEnv
+}
+
+// getContainersPath returns the path to containers based on resource kind
+func getContainersPath(resourceKind string) []string {
+	if resourceKind == kindDeployment {
+		return []string{"spec", "template", "spec", "containers"}
+	}
+	return []string{"spec", "containers"}
+}
+
 // injectConfigIntoDeployments injects environment variables and secret refs into deployments
 func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects []*unstructured.Unstructured,
 	mergedVars map[string]string, resolvedKeys map[string]secretKeySource, stackSecretName string, metadata StackMetadata) *ConfigInjectionResult {
 	log := logf.FromContext(ctx)
 	result := &ConfigInjectionResult{}
 
-	// Note: We removed the early return here because we ALWAYS need to inject LISSTO_* metadata,
-	// even if there are no variables or secrets to inject
-
 	for _, obj := range objects {
-		// Support both Deployment and Pod
-		if obj.GetKind() != "Deployment" && obj.GetKind() != "Pod" {
+		if obj.GetKind() != kindDeployment && obj.GetKind() != kindPod {
 			continue
 		}
 
 		resourceKind := obj.GetKind()
 		resourceName := obj.GetName()
+		containersPath := getContainersPath(resourceKind)
 
-		// Get containers path based on resource type
-		var containersPath []string
-		if resourceKind == "Deployment" {
-			containersPath = []string{"spec", "template", "spec", "containers"}
-		} else { // Pod
-			containersPath = []string{"spec", "containers"}
-		}
-
-		// Get containers
 		containers, found, err := unstructured.NestedSlice(obj.Object, containersPath...)
 		if err != nil || !found {
 			result.Warnings = append(result.Warnings,
@@ -498,165 +611,30 @@ func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects
 			continue
 		}
 
-		// Update each container
 		for i, container := range containers {
 			containerMap, ok := container.(map[string]interface{})
 			if !ok {
 				continue
 			}
 
-			// Get existing env vars
 			existingEnv, _, _ := unstructured.NestedSlice(containerMap, "env")
 			if existingEnv == nil {
 				existingEnv = []interface{}{}
 			}
 
-			// Step 1: Collect existing env var names from container (opt-in approach)
-			// Only variables/secrets that are already declared in the container will be injected
-			existingEnvNames := make(map[string]bool)
-			for _, envVar := range existingEnv {
-				envMap, ok := envVar.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				name, ok := envMap["name"].(string)
-				if !ok {
-					continue
-				}
-				// Don't include reserved variables in the "existing" set
-				// (they'll be handled separately and always injected)
-				if !isReservedEnvVar(name) {
-					existingEnvNames[name] = true
-				}
-			}
-
-			// Step 2: Filter variables - only inject if declared in container
-			filteredVars := make(map[string]string)
-			for key, value := range mergedVars {
-				if existingEnvNames[key] {
-					filteredVars[key] = value
-				}
-			}
-
-			// Step 3: Filter secrets - only inject if declared in container
-			filteredSecrets := make(map[string]secretKeySource)
-			for key, source := range resolvedKeys {
-				if existingEnvNames[key] {
-					filteredSecrets[key] = source
-				}
-			}
-
-			// Build hierarchy: secrets > variables > compose
-			// Secrets have highest priority, so track which keys are secrets
-			secretKeys := make(map[string]bool)
-			for key := range filteredSecrets {
-				secretKeys[key] = true
-			}
-
-			// Build set of keys that will be injected (filtered set only)
-			keysToInject := make(map[string]bool)
-			for key := range filteredVars {
-				keysToInject[key] = true
-			}
-			for key := range filteredSecrets {
-				keysToInject[key] = true
-			}
-
-			// Filter out existing env vars that conflict with injected ones
-			// ALSO filter out any reserved LISSTO_* variables (security)
-			filteredEnv := []interface{}{}
-			for _, envVar := range existingEnv {
-				envMap, ok := envVar.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				name, ok := envMap["name"].(string)
-				if !ok {
-					continue
-				}
-
-				// Skip reserved variables (prevent user override)
-				if isReservedEnvVar(name) {
-					log.V(1).Info("Filtering reserved env var from compose",
-						"name", name,
-						"container", containerMap["name"])
-					continue
-				}
-
-				// Keep only env vars that won't conflict with injected config
-				if !keysToInject[name] {
-					filteredEnv = append(filteredEnv, envVar)
-				}
-			}
-
-			// Inject reserved metadata variables (highest priority - controller-managed)
-			// These are ALWAYS injected and cannot be opted out
-			filteredEnv = append(filteredEnv,
-				map[string]interface{}{
-					"name":  "LISSTO_ENV",
-					"value": metadata.Env,
-				},
-				map[string]interface{}{
-					"name":  "LISSTO_STACK",
-					"value": metadata.StackName,
-				},
-				map[string]interface{}{
-					"name":  "LISSTO_USER",
-					"value": metadata.User,
-				},
-			)
-			result.MetadataInjected = 3
-
-			// Add filtered variables (only those declared in container)
-			// These override compose values, but NOT secrets
-			for key, value := range filteredVars {
-				// Skip if this key is also a secret (secrets have higher priority)
-				if secretKeys[key] {
-					continue
-				}
-				filteredEnv = append(filteredEnv, map[string]interface{}{
-					"name":  key,
-					"value": value,
-				})
-				result.VariablesInjected++
-			}
-
-			// Add filtered secret key refs (only those declared in container)
-			// These override both compose and variables
-			if stackSecretName != "" {
-				for key := range filteredSecrets {
-					filteredEnv = append(filteredEnv, map[string]interface{}{
-						"name": key,
-						"valueFrom": map[string]interface{}{
-							"secretKeyRef": map[string]interface{}{
-								"name": stackSecretName,
-								"key":  key,
-							},
-						},
-					})
-					result.SecretsInjected++
-				}
-			}
-
-			// Update container env
-			containerMap["env"] = filteredEnv
+			existingEnvNames := collectExistingEnvNames(existingEnv)
+			filteredVars, filteredSecrets := filterEnvByDeclared(mergedVars, resolvedKeys, existingEnvNames)
+			containerMap["env"] = buildInjectionEnv(existingEnv, filteredVars, filteredSecrets, stackSecretName, metadata, result)
 			containers[i] = containerMap
 		}
 
-		// Write back containers
 		if err := unstructured.SetNestedSlice(obj.Object, containers, containersPath...); err != nil {
-			log.Error(err, "Failed to set containers with config",
-				"kind", resourceKind,
-				"name", resourceName)
+			log.Error(err, "Failed to set containers with config", "kind", resourceKind, "name", resourceName)
 			result.Warnings = append(result.Warnings,
 				fmt.Sprintf("Failed to update containers in %s %s: %v", resourceKind, resourceName, err))
 		} else {
-			log.V(1).Info("Injected config into workload",
-				"kind", resourceKind,
-				"name", resourceName,
-				"containers", len(containers),
-				"variablesInjected", result.VariablesInjected,
-				"secretsInjected", result.SecretsInjected)
+			log.V(1).Info("Injected config into workload", "kind", resourceKind, "name", resourceName,
+				"containers", len(containers), "variablesInjected", result.VariablesInjected, "secretsInjected", result.SecretsInjected)
 		}
 	}
 

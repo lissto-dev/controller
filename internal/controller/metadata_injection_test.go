@@ -24,6 +24,8 @@ import (
 	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
 )
 
+const testStackName = "test-stack"
+
 var _ = Describe("Reserved Environment Variables", func() {
 	Context("isReservedEnvVar", func() {
 		It("should identify LISSTO_ENV as reserved", func() {
@@ -69,7 +71,7 @@ var _ = Describe("Reserved Environment Variables", func() {
 
 		It("should use 'unknown' when annotation is missing", func() {
 			stack := &envv1alpha1.Stack{}
-			stack.Name = "test-stack"
+			stack.Name = testStackName
 			stack.Spec.Env = "staging"
 			stack.Annotations = map[string]string{}
 
@@ -80,7 +82,7 @@ var _ = Describe("Reserved Environment Variables", func() {
 
 		It("should use 'unknown' when annotation is empty", func() {
 			stack := &envv1alpha1.Stack{}
-			stack.Name = "test-stack"
+			stack.Name = testStackName
 			stack.Spec.Env = "prod"
 			stack.Annotations = map[string]string{
 				"lissto.dev/created-by": "",
@@ -93,7 +95,7 @@ var _ = Describe("Reserved Environment Variables", func() {
 
 		It("should handle nil annotations", func() {
 			stack := &envv1alpha1.Stack{}
-			stack.Name = "test-stack"
+			stack.Name = testStackName
 			stack.Spec.Env = "dev"
 			stack.Annotations = nil
 
@@ -101,7 +103,7 @@ var _ = Describe("Reserved Environment Variables", func() {
 
 			Expect(metadata.User).To(Equal("unknown"))
 			Expect(metadata.Env).To(Equal("dev"))
-			Expect(metadata.StackName).To(Equal("test-stack"))
+			Expect(metadata.StackName).To(Equal(testStackName))
 		})
 	})
 
