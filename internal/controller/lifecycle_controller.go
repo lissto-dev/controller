@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +44,7 @@ const (
 type workerHandle struct {
 	cancel     context.CancelFunc
 	generation int64
+	executing  *atomic.Bool // Tracks if a task is currently running
 }
 
 // LifecycleReconciler reconciles a Lifecycle object
@@ -139,6 +141,7 @@ func (r *LifecycleReconciler) startWorker(lifecycle *envv1alpha1.Lifecycle) {
 	r.workers[lifecycle.Name] = workerHandle{
 		cancel:     cancel,
 		generation: lifecycle.Generation,
+		executing:  &atomic.Bool{},
 	}
 	r.mu.Unlock()
 
@@ -164,13 +167,35 @@ func (r *LifecycleReconciler) runWorker(ctx context.Context, lifecycleName strin
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Get the worker handle to access the executing flag
+	r.mu.Lock()
+	handle, exists := r.workers[lifecycleName]
+	r.mu.Unlock()
+
+	if !exists {
+		log.Error(fmt.Errorf("worker handle not found"), "Worker started but handle missing")
+		return
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info("Worker stopped")
 			return
 		case <-ticker.C:
-			r.executeTasks(ctx, lifecycleName)
+			// Check if previous execution is still running
+			if handle.executing.Load() {
+				log.Info("Skipping scheduled run - previous execution still in progress",
+					"interval", interval)
+				continue
+			}
+
+			// Mark as executing and run tasks in goroutine
+			handle.executing.Store(true)
+			go func() {
+				defer handle.executing.Store(false)
+				r.executeTasks(ctx, lifecycleName)
+			}()
 		}
 	}
 }
@@ -179,12 +204,29 @@ func (r *LifecycleReconciler) runWorker(ctx context.Context, lifecycleName strin
 func (r *LifecycleReconciler) executeTasks(ctx context.Context, lifecycleName string) {
 	log := logf.FromContext(ctx).WithValues("lifecycle", lifecycleName)
 
+	start := time.Now()
+	defer func() {
+		duration := time.Since(start)
+		log.Info("Task execution completed", "duration", duration)
+	}()
+
 	// Fetch the current Lifecycle object
 	var lifecycle envv1alpha1.Lifecycle
 	if err := r.Get(ctx, client.ObjectKey{Name: lifecycleName}, &lifecycle); err != nil {
 		log.Error(err, "Failed to fetch Lifecycle")
 		return
 	}
+
+	// Check if execution is taking longer than interval
+	defer func() {
+		duration := time.Since(start)
+		if duration > lifecycle.Spec.Interval.Duration {
+			log.Info("Warning: Task execution exceeded interval",
+				"duration", duration,
+				"interval", lifecycle.Spec.Interval.Duration,
+				"drift", duration-lifecycle.Spec.Interval.Duration)
+		}
+	}()
 
 	log.Info("Executing lifecycle tasks", "targetKind", lifecycle.Spec.TargetKind, "taskCount", len(lifecycle.Spec.Tasks))
 
@@ -252,6 +294,9 @@ func (r *LifecycleReconciler) executeDeleteTask(ctx context.Context, lifecycle *
 	now := time.Now()
 	threshold := now.Add(-task.OlderThan.Duration)
 
+	// Collect errors instead of returning immediately
+	var errs []error
+
 	switch lifecycle.Spec.TargetKind {
 	case "Stack":
 		var stackList envv1alpha1.StackList
@@ -260,13 +305,15 @@ func (r *LifecycleReconciler) executeDeleteTask(ctx context.Context, lifecycle *
 		}
 
 		evaluated = int64(len(stackList.Items))
-		for _, stack := range stackList.Items {
+		for i := range stackList.Items {
+			stack := &stackList.Items[i]
 			if stack.CreationTimestamp.Time.Before(threshold) {
 				log.Info("Deleting Stack", "name", stack.Name, "namespace", stack.Namespace, "age", now.Sub(stack.CreationTimestamp.Time))
-				if err := r.Delete(ctx, &stack); err != nil {
-					return deleted, evaluated, fmt.Errorf("failed to delete Stack %s/%s: %w", stack.Namespace, stack.Name, err)
+				if err := r.Delete(ctx, stack); err != nil {
+					errs = append(errs, fmt.Errorf("Stack %s/%s: %w", stack.Namespace, stack.Name, err))
+				} else {
+					deleted++
 				}
-				deleted++
 			}
 		}
 
@@ -277,18 +324,25 @@ func (r *LifecycleReconciler) executeDeleteTask(ctx context.Context, lifecycle *
 		}
 
 		evaluated = int64(len(blueprintList.Items))
-		for _, blueprint := range blueprintList.Items {
+		for i := range blueprintList.Items {
+			blueprint := &blueprintList.Items[i]
 			if blueprint.CreationTimestamp.Time.Before(threshold) {
 				log.Info("Deleting Blueprint", "name", blueprint.Name, "namespace", blueprint.Namespace, "age", now.Sub(blueprint.CreationTimestamp.Time))
-				if err := r.Delete(ctx, &blueprint); err != nil {
-					return deleted, evaluated, fmt.Errorf("failed to delete Blueprint %s/%s: %w", blueprint.Namespace, blueprint.Name, err)
+				if err := r.Delete(ctx, blueprint); err != nil {
+					errs = append(errs, fmt.Errorf("Blueprint %s/%s: %w", blueprint.Namespace, blueprint.Name, err))
+				} else {
+					deleted++
 				}
-				deleted++
 			}
 		}
 
 	default:
 		return 0, 0, fmt.Errorf("unsupported target kind: %s", lifecycle.Spec.TargetKind)
+	}
+
+	// Return accumulated errors if any
+	if len(errs) > 0 {
+		return deleted, evaluated, fmt.Errorf("failed to delete %d object(s): %v", len(errs), errs)
 	}
 
 	return deleted, evaluated, nil
