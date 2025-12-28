@@ -17,503 +17,382 @@ limitations under the License.
 package namespace
 
 import (
-	"testing"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
-func TestNewManager(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
+var _ = Describe("Namespace Manager", func() {
+	Describe("NewManager", func() {
+		It("should create a manager with correct configuration", func() {
+			m := NewManager("lissto-global", "lissto-")
 
-	if m.GetGlobalNamespace() != "lissto-global" {
-		t.Errorf("GetGlobalNamespace() = %q, want %q", m.GetGlobalNamespace(), "lissto-global")
-	}
-	if m.GetDeveloperPrefix() != "lissto-" {
-		t.Errorf("GetDeveloperPrefix() = %q, want %q", m.GetDeveloperPrefix(), "lissto-")
-	}
-}
-
-func TestGetDeveloperNamespace(t *testing.T) {
-	tests := []struct {
-		name     string
-		prefix   string
-		username string
-		want     string
-	}{
-		{"standard prefix", "lissto-", "daniel", "lissto-daniel"},
-		{"dev prefix", "dev-", "alice", "dev-alice"},
-		{"empty username", "lissto-", "", "lissto-"},
-		{"complex username", "ns-", "user.name", "ns-user.name"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			m := NewManager("global", tt.prefix)
-			got := m.GetDeveloperNamespace(tt.username)
-			if got != tt.want {
-				t.Errorf("GetDeveloperNamespace(%q) = %q, want %q", tt.username, got, tt.want)
-			}
+			Expect(m.GetGlobalNamespace()).To(Equal("lissto-global"))
+			Expect(m.GetDeveloperPrefix()).To(Equal("lissto-"))
 		})
-	}
-}
+	})
 
-func TestIsGlobalNamespace(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
+	Describe("GetDeveloperNamespace", func() {
+		DescribeTable("should generate correct developer namespace",
+			func(prefix, username, expected string) {
+				m := NewManager("global", prefix)
+				Expect(m.GetDeveloperNamespace(username)).To(Equal(expected))
+			},
+			Entry("standard prefix", "lissto-", "daniel", "lissto-daniel"),
+			Entry("dev prefix", "dev-", "alice", "dev-alice"),
+			Entry("empty username", "lissto-", "", "lissto-"),
+			Entry("complex username", "ns-", "user.name", "ns-user.name"),
+		)
+	})
 
-	tests := []struct {
-		namespace string
-		want      bool
-	}{
-		{"lissto-global", true},
-		{"lissto-daniel", false},
-		{"other-namespace", false},
-		{"", false},
-		{"lissto-global-extra", false},
-	}
+	Describe("IsGlobalNamespace", func() {
+		var m *Manager
 
-	for _, tt := range tests {
-		t.Run(tt.namespace, func(t *testing.T) {
-			got := m.IsGlobalNamespace(tt.namespace)
-			if got != tt.want {
-				t.Errorf("IsGlobalNamespace(%q) = %v, want %v", tt.namespace, got, tt.want)
-			}
+		BeforeEach(func() {
+			m = NewManager("lissto-global", "lissto-")
 		})
-	}
-}
 
-func TestIsDeveloperNamespace(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
+		DescribeTable("should correctly identify global namespace",
+			func(namespace string, expected bool) {
+				Expect(m.IsGlobalNamespace(namespace)).To(Equal(expected))
+			},
+			Entry("exact match", "lissto-global", true),
+			Entry("developer namespace", "lissto-daniel", false),
+			Entry("other namespace", "other-namespace", false),
+			Entry("empty string", "", false),
+			Entry("global with suffix", "lissto-global-extra", false),
+		)
+	})
 
-	tests := []struct {
-		namespace string
-		want      bool
-	}{
-		{"lissto-daniel", true},
-		{"lissto-alice", true},
-		{"lissto-", true}, // edge case: just prefix
-		{"lissto-global", false}, // global namespace should not be developer
-		{"dev-daniel", false},
-		{"other-namespace", false},
-		{"", false},
-	}
+	Describe("IsDeveloperNamespace", func() {
+		var m *Manager
 
-	for _, tt := range tests {
-		t.Run(tt.namespace, func(t *testing.T) {
-			got := m.IsDeveloperNamespace(tt.namespace)
-			if got != tt.want {
-				t.Errorf("IsDeveloperNamespace(%q) = %v, want %v", tt.namespace, got, tt.want)
-			}
+		BeforeEach(func() {
+			m = NewManager("lissto-global", "lissto-")
 		})
-	}
-}
 
-func TestGetOwnerFromNamespace(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
+		DescribeTable("should correctly identify developer namespace",
+			func(namespace string, expected bool) {
+				Expect(m.IsDeveloperNamespace(namespace)).To(Equal(expected))
+			},
+			Entry("developer namespace daniel", "lissto-daniel", true),
+			Entry("developer namespace alice", "lissto-alice", true),
+			Entry("just prefix (edge case)", "lissto-", true),
+			Entry("global namespace should not be developer", "lissto-global", false),
+			Entry("different prefix", "dev-daniel", false),
+			Entry("other namespace", "other-namespace", false),
+			Entry("empty string", "", false),
+		)
+	})
 
-	tests := []struct {
-		namespace string
-		want      string
-		wantErr   bool
-	}{
-		{"lissto-daniel", "daniel", false},
-		{"lissto-alice", "alice", false},
-		{"lissto-user.name", "user.name", false},
-		{"lissto-", "", false}, // edge case: just prefix
-		{"lissto-global", "", true}, // global is not developer
-		{"dev-daniel", "", true},
-		{"other-namespace", "", true},
-		{"", "", true},
-	}
+	Describe("GetOwnerFromNamespace", func() {
+		var m *Manager
 
-	for _, tt := range tests {
-		t.Run(tt.namespace, func(t *testing.T) {
-			got, err := m.GetOwnerFromNamespace(tt.namespace)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("GetOwnerFromNamespace(%q) error = %v, wantErr %v", tt.namespace, err, tt.wantErr)
-				return
-			}
-			if got != tt.want {
-				t.Errorf("GetOwnerFromNamespace(%q) = %q, want %q", tt.namespace, got, tt.want)
-			}
+		BeforeEach(func() {
+			m = NewManager("lissto-global", "lissto-")
 		})
-	}
-}
 
-func TestNormalizeToScope(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
-
-	tests := []struct {
-		namespace string
-		want      string
-		wantErr   bool
-	}{
-		{"lissto-global", "global", false},
-		{"lissto-daniel", "daniel", false},
-		{"lissto-alice", "alice", false},
-		{"other-namespace", "", true},
-		{"", "", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.namespace, func(t *testing.T) {
-			got, err := m.NormalizeToScope(tt.namespace)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("NormalizeToScope(%q) error = %v, wantErr %v", tt.namespace, err, tt.wantErr)
-				return
-			}
-			if got != tt.want {
-				t.Errorf("NormalizeToScope(%q) = %q, want %q", tt.namespace, got, tt.want)
-			}
+		Context("with valid developer namespaces", func() {
+			DescribeTable("should extract owner correctly",
+				func(namespace, expectedOwner string) {
+					owner, err := m.GetOwnerFromNamespace(namespace)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(owner).To(Equal(expectedOwner))
+				},
+				Entry("daniel", "lissto-daniel", "daniel"),
+				Entry("alice", "lissto-alice", "alice"),
+				Entry("user.name", "lissto-user.name", "user.name"),
+				Entry("just prefix (edge case)", "lissto-", ""),
+			)
 		})
-	}
-}
 
-func TestGenerateScopedID(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
-
-	tests := []struct {
-		namespace string
-		name      string
-		want      string
-		wantErr   bool
-	}{
-		{"lissto-global", "bp-123", "global/bp-123", false},
-		{"lissto-daniel", "bp-456", "daniel/bp-456", false},
-		{"lissto-alice", "stack-789", "alice/stack-789", false},
-		{"other-namespace", "bp-123", "", true},
-		{"", "bp-123", "", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.namespace+"/"+tt.name, func(t *testing.T) {
-			got, err := m.GenerateScopedID(tt.namespace, tt.name)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("GenerateScopedID(%q, %q) error = %v, wantErr %v", tt.namespace, tt.name, err, tt.wantErr)
-				return
-			}
-			if got != tt.want {
-				t.Errorf("GenerateScopedID(%q, %q) = %q, want %q", tt.namespace, tt.name, got, tt.want)
-			}
+		Context("with invalid namespaces", func() {
+			DescribeTable("should return error",
+				func(namespace string) {
+					_, err := m.GetOwnerFromNamespace(namespace)
+					Expect(err).To(HaveOccurred())
+				},
+				Entry("global namespace", "lissto-global"),
+				Entry("different prefix", "dev-daniel"),
+				Entry("other namespace", "other-namespace"),
+				Entry("empty string", ""),
+			)
 		})
-	}
-}
+	})
 
-func TestMustGenerateScopedID(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
+	Describe("NormalizeToScope", func() {
+		var m *Manager
 
-	// Test valid case
-	got := m.MustGenerateScopedID("lissto-global", "bp-123")
-	if got != "global/bp-123" {
-		t.Errorf("MustGenerateScopedID() = %q, want %q", got, "global/bp-123")
-	}
-
-	// Test panic case
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("MustGenerateScopedID() did not panic for invalid namespace")
-		}
-	}()
-	m.MustGenerateScopedID("invalid-namespace", "bp-123")
-}
-
-func TestParseScopedID(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
-
-	tests := []struct {
-		scopedID      string
-		wantNamespace string
-		wantName      string
-		wantErr       bool
-	}{
-		{"global/bp-123", "lissto-global", "bp-123", false},
-		{"daniel/bp-456", "lissto-daniel", "bp-456", false},
-		{"alice/stack-789", "lissto-alice", "stack-789", false},
-		{"bp-legacy", "", "bp-legacy", false}, // legacy format
-		{"just-name", "", "just-name", false}, // legacy format
-		{"/bp-123", "", "", true},             // empty scope
-		{"daniel/", "", "", true},             // empty name
-		{"/", "", "", true},                   // both empty
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.scopedID, func(t *testing.T) {
-			gotNS, gotName, err := m.ParseScopedID(tt.scopedID)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseScopedID(%q) error = %v, wantErr %v", tt.scopedID, err, tt.wantErr)
-				return
-			}
-			if gotNS != tt.wantNamespace {
-				t.Errorf("ParseScopedID(%q) namespace = %q, want %q", tt.scopedID, gotNS, tt.wantNamespace)
-			}
-			if gotName != tt.wantName {
-				t.Errorf("ParseScopedID(%q) name = %q, want %q", tt.scopedID, gotName, tt.wantName)
-			}
+		BeforeEach(func() {
+			m = NewManager("lissto-global", "lissto-")
 		})
-	}
-}
 
-func TestParseScopedIDWithDefault(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
-	defaultNS := "lissto-daniel"
-
-	tests := []struct {
-		scopedID      string
-		wantNamespace string
-		wantName      string
-		wantErr       bool
-	}{
-		{"global/bp-123", "lissto-global", "bp-123", false},
-		{"alice/bp-456", "lissto-alice", "bp-456", false},
-		{"bp-legacy", "lissto-daniel", "bp-legacy", false}, // uses default
-		{"just-name", "lissto-daniel", "just-name", false}, // uses default
-		{"/bp-123", "", "", true},                          // invalid
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.scopedID, func(t *testing.T) {
-			gotNS, gotName, err := m.ParseScopedIDWithDefault(tt.scopedID, defaultNS)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseScopedIDWithDefault(%q) error = %v, wantErr %v", tt.scopedID, err, tt.wantErr)
-				return
-			}
-			if gotNS != tt.wantNamespace {
-				t.Errorf("ParseScopedIDWithDefault(%q) namespace = %q, want %q", tt.scopedID, gotNS, tt.wantNamespace)
-			}
-			if gotName != tt.wantName {
-				t.Errorf("ParseScopedIDWithDefault(%q) name = %q, want %q", tt.scopedID, gotName, tt.wantName)
-			}
+		Context("with valid namespaces", func() {
+			DescribeTable("should normalize correctly",
+				func(namespace, expectedScope string) {
+					scope, err := m.NormalizeToScope(namespace)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(scope).To(Equal(expectedScope))
+				},
+				Entry("global namespace", "lissto-global", "global"),
+				Entry("developer namespace daniel", "lissto-daniel", "daniel"),
+				Entry("developer namespace alice", "lissto-alice", "alice"),
+			)
 		})
-	}
-}
 
-func TestIsNamespaceAllowed(t *testing.T) {
-	tests := []struct {
-		name      string
-		namespace string
-		allowed   []string
-		want      bool
-	}{
-		{"exact match", "lissto-daniel", []string{"lissto-daniel", "lissto-global"}, true},
-		{"no match", "lissto-alice", []string{"lissto-daniel", "lissto-global"}, false},
-		{"wildcard", "any-namespace", []string{"*"}, true},
-		{"empty allowed", "lissto-daniel", []string{}, false},
-		{"empty namespace", "", []string{"lissto-daniel"}, false},
-		{"wildcard not first", "any-namespace", []string{"lissto-daniel", "*"}, false}, // wildcard only works as first element
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := IsNamespaceAllowed(tt.namespace, tt.allowed)
-			if got != tt.want {
-				t.Errorf("IsNamespaceAllowed(%q, %v) = %v, want %v", tt.namespace, tt.allowed, got, tt.want)
-			}
+		Context("with invalid namespaces", func() {
+			DescribeTable("should return error",
+				func(namespace string) {
+					_, err := m.NormalizeToScope(namespace)
+					Expect(err).To(HaveOccurred())
+				},
+				Entry("other namespace", "other-namespace"),
+				Entry("empty string", ""),
+			)
 		})
-	}
-}
+	})
 
-func TestResolveNamespaceFromID(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
-	allowedNS := []string{"lissto-daniel", "lissto-global"}
+	Describe("GenerateScopedID", func() {
+		var m *Manager
 
-	tests := []struct {
-		name          string
-		idParam       string
-		wantTargetNS  string
-		wantName      string
-		wantSearchAll bool
-	}{
-		{"scoped global allowed", "global/bp-123", "lissto-global", "bp-123", false},
-		{"scoped user allowed", "daniel/bp-456", "lissto-daniel", "bp-456", false},
-		{"scoped user not allowed", "alice/bp-789", "", "bp-789", false},
-		{"legacy format", "bp-legacy", "", "bp-legacy", true},
-		{"invalid format", "/bp-123", "", "/bp-123", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotTargetNS, gotName, gotSearchAll := m.ResolveNamespaceFromID(tt.idParam, allowedNS)
-			if gotTargetNS != tt.wantTargetNS {
-				t.Errorf("ResolveNamespaceFromID(%q) targetNS = %q, want %q", tt.idParam, gotTargetNS, tt.wantTargetNS)
-			}
-			if gotName != tt.wantName {
-				t.Errorf("ResolveNamespaceFromID(%q) name = %q, want %q", tt.idParam, gotName, tt.wantName)
-			}
-			if gotSearchAll != tt.wantSearchAll {
-				t.Errorf("ResolveNamespaceFromID(%q) searchAll = %v, want %v", tt.idParam, gotSearchAll, tt.wantSearchAll)
-			}
+		BeforeEach(func() {
+			m = NewManager("lissto-global", "lissto-")
 		})
-	}
-}
 
-func TestResolveNamespaceFromIDWithWildcard(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
-	allowedNS := []string{"*"} // admin access
-
-	tests := []struct {
-		name          string
-		idParam       string
-		wantTargetNS  string
-		wantName      string
-		wantSearchAll bool
-	}{
-		{"scoped any user", "alice/bp-123", "lissto-alice", "bp-123", false},
-		{"scoped global", "global/bp-456", "lissto-global", "bp-456", false},
-		{"legacy format", "bp-legacy", "", "bp-legacy", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotTargetNS, gotName, gotSearchAll := m.ResolveNamespaceFromID(tt.idParam, allowedNS)
-			if gotTargetNS != tt.wantTargetNS {
-				t.Errorf("ResolveNamespaceFromID(%q) targetNS = %q, want %q", tt.idParam, gotTargetNS, tt.wantTargetNS)
-			}
-			if gotName != tt.wantName {
-				t.Errorf("ResolveNamespaceFromID(%q) name = %q, want %q", tt.idParam, gotName, tt.wantName)
-			}
-			if gotSearchAll != tt.wantSearchAll {
-				t.Errorf("ResolveNamespaceFromID(%q) searchAll = %v, want %v", tt.idParam, gotSearchAll, tt.wantSearchAll)
-			}
+		Context("with valid inputs", func() {
+			DescribeTable("should generate correct scoped ID",
+				func(namespace, name, expected string) {
+					scopedID, err := m.GenerateScopedID(namespace, name)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(scopedID).To(Equal(expected))
+				},
+				Entry("global namespace", "lissto-global", "bp-123", "global/bp-123"),
+				Entry("developer namespace daniel", "lissto-daniel", "bp-456", "daniel/bp-456"),
+				Entry("developer namespace alice", "lissto-alice", "stack-789", "alice/stack-789"),
+			)
 		})
-	}
-}
 
-func TestResolveNamespacesToSearch(t *testing.T) {
-	userNS := "lissto-daniel"
-	globalNS := "lissto-global"
-
-	tests := []struct {
-		name      string
-		targetNS  string
-		searchAll bool
-		allowedNS []string
-		want      []string
-	}{
-		{
-			"scoped ID - specific namespace",
-			"lissto-alice",
-			false,
-			[]string{"lissto-daniel", "lissto-global"},
-			[]string{"lissto-alice"},
-		},
-		{
-			"legacy ID - user and global allowed",
-			"",
-			true,
-			[]string{"lissto-daniel", "lissto-global"},
-			[]string{"lissto-daniel", "lissto-global"},
-		},
-		{
-			"legacy ID - only user allowed",
-			"",
-			true,
-			[]string{"lissto-daniel"},
-			[]string{"lissto-daniel"},
-		},
-		{
-			"not authorized",
-			"",
-			false,
-			[]string{"lissto-daniel", "lissto-global"},
-			[]string{},
-		},
-		{
-			"wildcard allowed",
-			"",
-			true,
-			[]string{"*"},
-			[]string{"lissto-daniel", "lissto-global"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ResolveNamespacesToSearch(tt.targetNS, userNS, globalNS, tt.searchAll, tt.allowedNS)
-			if len(got) != len(tt.want) {
-				t.Errorf("ResolveNamespacesToSearch() = %v, want %v", got, tt.want)
-				return
-			}
-			for i := range got {
-				if got[i] != tt.want[i] {
-					t.Errorf("ResolveNamespacesToSearch()[%d] = %q, want %q", i, got[i], tt.want[i])
-				}
-			}
+		Context("with invalid inputs", func() {
+			DescribeTable("should return error",
+				func(namespace, name string) {
+					_, err := m.GenerateScopedID(namespace, name)
+					Expect(err).To(HaveOccurred())
+				},
+				Entry("other namespace", "other-namespace", "bp-123"),
+				Entry("empty namespace", "", "bp-123"),
+			)
 		})
-	}
-}
+	})
 
-func TestRoundTrip(t *testing.T) {
-	m := NewManager("lissto-global", "lissto-")
+	Describe("MustGenerateScopedID", func() {
+		var m *Manager
 
-	// Test that GenerateScopedID and ParseScopedID are inverses
-	testCases := []struct {
-		namespace string
-		name      string
-	}{
-		{"lissto-global", "blueprint-123"},
-		{"lissto-daniel", "stack-456"},
-		{"lissto-alice", "env-789"},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.namespace+"/"+tc.name, func(t *testing.T) {
-			// Generate scoped ID
-			scopedID, err := m.GenerateScopedID(tc.namespace, tc.name)
-			if err != nil {
-				t.Fatalf("GenerateScopedID() error = %v", err)
-			}
-
-			// Parse it back
-			gotNS, gotName, err := m.ParseScopedID(scopedID)
-			if err != nil {
-				t.Fatalf("ParseScopedID() error = %v", err)
-			}
-
-			if gotNS != tc.namespace {
-				t.Errorf("Round trip namespace = %q, want %q", gotNS, tc.namespace)
-			}
-			if gotName != tc.name {
-				t.Errorf("Round trip name = %q, want %q", gotName, tc.name)
-			}
+		BeforeEach(func() {
+			m = NewManager("lissto-global", "lissto-")
 		})
-	}
-}
 
-func TestDifferentPrefixes(t *testing.T) {
-	// Test with different prefix configurations
-	configs := []struct {
-		globalNS string
-		prefix   string
-	}{
-		{"lissto-global", "lissto-"},
-		{"global", "dev-"},
-		{"prod-global", "prod-"},
-	}
-
-	for _, cfg := range configs {
-		t.Run(cfg.prefix, func(t *testing.T) {
-			m := NewManager(cfg.globalNS, cfg.prefix)
-
-			// Test developer namespace
-			devNS := m.GetDeveloperNamespace("testuser")
-			if devNS != cfg.prefix+"testuser" {
-				t.Errorf("GetDeveloperNamespace() = %q, want %q", devNS, cfg.prefix+"testuser")
-			}
-
-			// Test round trip
-			scopedID, err := m.GenerateScopedID(devNS, "resource-123")
-			if err != nil {
-				t.Fatalf("GenerateScopedID() error = %v", err)
-			}
-
-			gotNS, gotName, err := m.ParseScopedID(scopedID)
-			if err != nil {
-				t.Fatalf("ParseScopedID() error = %v", err)
-			}
-
-			if gotNS != devNS {
-				t.Errorf("Round trip namespace = %q, want %q", gotNS, devNS)
-			}
-			if gotName != "resource-123" {
-				t.Errorf("Round trip name = %q, want %q", gotName, "resource-123")
-			}
+		It("should return scoped ID for valid input", func() {
+			Expect(m.MustGenerateScopedID("lissto-global", "bp-123")).To(Equal("global/bp-123"))
 		})
-	}
-}
+
+		It("should panic for invalid namespace", func() {
+			Expect(func() {
+				m.MustGenerateScopedID("invalid-namespace", "bp-123")
+			}).To(Panic())
+		})
+	})
+
+	Describe("ParseScopedID", func() {
+		var m *Manager
+
+		BeforeEach(func() {
+			m = NewManager("lissto-global", "lissto-")
+		})
+
+		Context("with valid scoped IDs", func() {
+			DescribeTable("should parse correctly",
+				func(scopedID, expectedNS, expectedName string) {
+					ns, name, err := m.ParseScopedID(scopedID)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(ns).To(Equal(expectedNS))
+					Expect(name).To(Equal(expectedName))
+				},
+				Entry("global scoped", "global/bp-123", "lissto-global", "bp-123"),
+				Entry("developer scoped daniel", "daniel/bp-456", "lissto-daniel", "bp-456"),
+				Entry("developer scoped alice", "alice/stack-789", "lissto-alice", "stack-789"),
+				Entry("legacy format (no slash)", "bp-legacy", "", "bp-legacy"),
+				Entry("legacy format (just name)", "just-name", "", "just-name"),
+			)
+		})
+
+		Context("with invalid scoped IDs", func() {
+			DescribeTable("should return error",
+				func(scopedID string) {
+					_, _, err := m.ParseScopedID(scopedID)
+					Expect(err).To(HaveOccurred())
+				},
+				Entry("empty scope", "/bp-123"),
+				Entry("empty name", "daniel/"),
+				Entry("both empty", "/"),
+			)
+		})
+	})
+
+	Describe("ParseScopedIDWithDefault", func() {
+		var m *Manager
+		const defaultNS = "lissto-daniel"
+
+		BeforeEach(func() {
+			m = NewManager("lissto-global", "lissto-")
+		})
+
+		Context("with valid scoped IDs", func() {
+			DescribeTable("should parse correctly with default",
+				func(scopedID, expectedNS, expectedName string) {
+					ns, name, err := m.ParseScopedIDWithDefault(scopedID, defaultNS)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(ns).To(Equal(expectedNS))
+					Expect(name).To(Equal(expectedName))
+				},
+				Entry("global scoped", "global/bp-123", "lissto-global", "bp-123"),
+				Entry("developer scoped alice", "alice/bp-456", "lissto-alice", "bp-456"),
+				Entry("legacy format uses default", "bp-legacy", "lissto-daniel", "bp-legacy"),
+				Entry("just name uses default", "just-name", "lissto-daniel", "just-name"),
+			)
+		})
+
+		It("should return error for invalid format", func() {
+			_, _, err := m.ParseScopedIDWithDefault("/bp-123", defaultNS)
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Describe("IsNamespaceAllowed", func() {
+		DescribeTable("should check namespace access correctly",
+			func(namespace string, allowed []string, expected bool) {
+				Expect(IsNamespaceAllowed(namespace, allowed)).To(Equal(expected))
+			},
+			Entry("exact match", "lissto-daniel", []string{"lissto-daniel", "lissto-global"}, true),
+			Entry("no match", "lissto-alice", []string{"lissto-daniel", "lissto-global"}, false),
+			Entry("wildcard", "any-namespace", []string{"*"}, true),
+			Entry("empty allowed list", "lissto-daniel", []string{}, false),
+			Entry("empty namespace", "", []string{"lissto-daniel"}, false),
+			Entry("wildcard not first", "any-namespace", []string{"lissto-daniel", "*"}, false),
+		)
+	})
+
+	Describe("ResolveNamespaceFromID", func() {
+		var m *Manager
+
+		BeforeEach(func() {
+			m = NewManager("lissto-global", "lissto-")
+		})
+
+		Context("with standard allowed namespaces", func() {
+			allowedNS := []string{"lissto-daniel", "lissto-global"}
+
+			DescribeTable("should resolve correctly",
+				func(idParam, expectedTargetNS, expectedName string, expectedSearchAll bool) {
+					targetNS, name, searchAll := m.ResolveNamespaceFromID(idParam, allowedNS)
+					Expect(targetNS).To(Equal(expectedTargetNS))
+					Expect(name).To(Equal(expectedName))
+					Expect(searchAll).To(Equal(expectedSearchAll))
+				},
+				Entry("scoped global allowed", "global/bp-123", "lissto-global", "bp-123", false),
+				Entry("scoped user allowed", "daniel/bp-456", "lissto-daniel", "bp-456", false),
+				Entry("scoped user not allowed", "alice/bp-789", "", "bp-789", false),
+				Entry("legacy format", "bp-legacy", "", "bp-legacy", true),
+				Entry("invalid format", "/bp-123", "", "/bp-123", false),
+			)
+		})
+
+		Context("with wildcard (admin) access", func() {
+			allowedNS := []string{"*"}
+
+			DescribeTable("should resolve correctly with wildcard",
+				func(idParam, expectedTargetNS, expectedName string, expectedSearchAll bool) {
+					targetNS, name, searchAll := m.ResolveNamespaceFromID(idParam, allowedNS)
+					Expect(targetNS).To(Equal(expectedTargetNS))
+					Expect(name).To(Equal(expectedName))
+					Expect(searchAll).To(Equal(expectedSearchAll))
+				},
+				Entry("scoped any user", "alice/bp-123", "lissto-alice", "bp-123", false),
+				Entry("scoped global", "global/bp-456", "lissto-global", "bp-456", false),
+				Entry("legacy format", "bp-legacy", "", "bp-legacy", true),
+			)
+		})
+	})
+
+	Describe("ResolveNamespacesToSearch", func() {
+		const userNS = "lissto-daniel"
+		const globalNS = "lissto-global"
+
+		DescribeTable("should resolve search namespaces correctly",
+			func(targetNS string, searchAll bool, allowedNS []string, expected []string) {
+				result := ResolveNamespacesToSearch(targetNS, userNS, globalNS, searchAll, allowedNS)
+				Expect(result).To(Equal(expected))
+			},
+			Entry("scoped ID - specific namespace",
+				"lissto-alice", false, []string{"lissto-daniel", "lissto-global"},
+				[]string{"lissto-alice"}),
+			Entry("legacy ID - user and global allowed",
+				"", true, []string{"lissto-daniel", "lissto-global"},
+				[]string{"lissto-daniel", "lissto-global"}),
+			Entry("legacy ID - only user allowed",
+				"", true, []string{"lissto-daniel"},
+				[]string{"lissto-daniel"}),
+			Entry("not authorized",
+				"", false, []string{"lissto-daniel", "lissto-global"},
+				[]string{}),
+			Entry("wildcard allowed",
+				"", true, []string{"*"},
+				[]string{"lissto-daniel", "lissto-global"}),
+		)
+	})
+
+	Describe("Round Trip", func() {
+		var m *Manager
+
+		BeforeEach(func() {
+			m = NewManager("lissto-global", "lissto-")
+		})
+
+		DescribeTable("GenerateScopedID and ParseScopedID should be inverses",
+			func(namespace, name string) {
+				scopedID, err := m.GenerateScopedID(namespace, name)
+				Expect(err).NotTo(HaveOccurred())
+
+				gotNS, gotName, err := m.ParseScopedID(scopedID)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(gotNS).To(Equal(namespace))
+				Expect(gotName).To(Equal(name))
+			},
+			Entry("global namespace", "lissto-global", "blueprint-123"),
+			Entry("developer namespace daniel", "lissto-daniel", "stack-456"),
+			Entry("developer namespace alice", "lissto-alice", "env-789"),
+		)
+	})
+
+	Describe("Different Prefix Configurations", func() {
+		DescribeTable("should work with various prefix configurations",
+			func(globalNS, prefix string) {
+				m := NewManager(globalNS, prefix)
+
+				// Test developer namespace generation
+				devNS := m.GetDeveloperNamespace("testuser")
+				Expect(devNS).To(Equal(prefix + "testuser"))
+
+				// Test round trip
+				scopedID, err := m.GenerateScopedID(devNS, "resource-123")
+				Expect(err).NotTo(HaveOccurred())
+
+				gotNS, gotName, err := m.ParseScopedID(scopedID)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(gotNS).To(Equal(devNS))
+				Expect(gotName).To(Equal("resource-123"))
+			},
+			Entry("lissto prefix", "lissto-global", "lissto-"),
+			Entry("dev prefix", "global", "dev-"),
+			Entry("prod prefix", "prod-global", "prod-"),
+		)
+	})
+})
