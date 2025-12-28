@@ -214,12 +214,12 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "Blueprint")
 		os.Exit(1)
 	}
-	if err := (&controller.StackLifecycleReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Config: cfg,
+	if err := (&controller.LifecycleReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("lifecycle-controller"),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "StackLifecycle")
+		setupLog.Error(err, "unable to create controller", "controller", "Lifecycle")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

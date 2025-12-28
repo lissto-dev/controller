@@ -22,13 +22,16 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the operator itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
-- stacklifecycle_admin_role.yaml
-- stacklifecycle_editor_role.yaml
-- stacklifecycle_viewer_role.yaml
+- lifecycle_admin_role.yaml
+- lifecycle_editor_role.yaml
+- lifecycle_viewer_role.yaml
 - blueprint_admin_role.yaml
 - blueprint_editor_role.yaml
 - blueprint_viewer_role.yaml
 - stack_admin_role.yaml
 - stack_editor_role.yaml
 - stack_viewer_role.yaml
+- env_admin_role.yaml
+- env_editor_role.yaml
+- env_viewer_role.yaml
 

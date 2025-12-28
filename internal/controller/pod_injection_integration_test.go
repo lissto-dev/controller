@@ -33,6 +33,8 @@ import (
 	"github.com/lissto-dev/controller/pkg/config"
 )
 
+const stackKind = "Stack"
+
 var _ = Describe("Pod and Deployment Integration Tests", func() {
 	var (
 		testNamespace string
@@ -447,7 +449,7 @@ var _ = Describe("Pod and Deployment Integration Tests", func() {
 				"Deployment should have owner references")
 			hasDeploymentOwner := false
 			for _, ref := range deployment.GetOwnerReferences() {
-				if ref.UID == createdStack.UID && ref.Kind == "Stack" {
+				if ref.UID == createdStack.UID && ref.Kind == stackKind {
 					hasDeploymentOwner = true
 					break
 				}
@@ -459,7 +461,7 @@ var _ = Describe("Pod and Deployment Integration Tests", func() {
 				"Pod should have owner references")
 			hasPodOwner := false
 			for _, ref := range pod.GetOwnerReferences() {
-				if ref.UID == createdStack.UID && ref.Kind == "Stack" {
+				if ref.UID == createdStack.UID && ref.Kind == stackKind {
 					hasPodOwner = true
 					break
 				}

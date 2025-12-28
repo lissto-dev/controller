@@ -50,7 +50,7 @@ rules:
   resources:
   - blueprints
   - envs
-  - stacklifecycles
+  - lifecycles
   - stacks
   verbs:
   - create
@@ -64,7 +64,7 @@ rules:
   - env.lissto.dev
   resources:
   - blueprints/finalizers
-  - stacklifecycles/finalizers
+  - lifecycles/finalizers
   - stacks/finalizers
   verbs:
   - update
@@ -73,7 +73,7 @@ rules:
   resources:
   - blueprints/status
   - envs/status
-  - stacklifecycles/status
+  - lifecycles/status
   - stacks/status
   verbs:
   - get

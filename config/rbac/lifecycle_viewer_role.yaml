@@ -1,0 +1,23 @@
+# permissions for viewer users to view lifecycles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: lifecycle-viewer-role
+rules:
+- apiGroups:
+  - env.lissto.dev
+  resources:
+  - lifecycles
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - env.lissto.dev
+  resources:
+  - lifecycles/status
+  verbs:
+  - get
