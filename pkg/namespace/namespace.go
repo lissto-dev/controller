@@ -186,7 +186,10 @@ func IsNamespaceAllowed(namespace string, allowedNamespaces []string) bool {
 //   - searchAll: true if should search all allowed namespaces (legacy behavior)
 //
 // This centralizes the logic for handling both scoped IDs and legacy format.
-func (m *Manager) ResolveNamespaceFromID(idParam string, allowedNamespaces []string) (targetNamespace, name string, searchAll bool) {
+func (m *Manager) ResolveNamespaceFromID(
+	idParam string,
+	allowedNamespaces []string,
+) (targetNamespace, name string, searchAll bool) {
 	// Parse the ID (could be scoped like "daniel/ID" or legacy format "ID")
 	parsedNS, parsedName, err := m.ParseScopedID(idParam)
 	if err != nil {

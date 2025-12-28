@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/lissto-dev/controller/pkg/namespace"
 	"gopkg.in/yaml.v3"
 )
 
@@ -39,14 +40,20 @@ type NamespacesConfig struct {
 	DeveloperPrefix string `yaml:"developerPrefix"`
 }
 
+// NewManager creates a namespace.Manager from the configuration
+func (nc *NamespacesConfig) NewManager() *namespace.Manager {
+	return namespace.NewManager(nc.Global, nc.DeveloperPrefix)
+}
+
 // IsGlobalNamespace checks if a namespace is the global namespace
-func (nc *NamespacesConfig) IsGlobalNamespace(namespace string) bool {
-	return namespace == nc.Global
+func (nc *NamespacesConfig) IsGlobalNamespace(ns string) bool {
+	return nc.NewManager().IsGlobalNamespace(ns)
 }
 
 // IsDeveloperNamespace checks if a namespace is a developer namespace
-func (nc *NamespacesConfig) IsDeveloperNamespace(namespace string) bool {
-	return strings.HasPrefix(namespace, nc.DeveloperPrefix)
+// Note: This excludes the global namespace even if it has the developer prefix
+func (nc *NamespacesConfig) IsDeveloperNamespace(ns string) bool {
+	return nc.NewManager().IsDeveloperNamespace(ns)
 }
 
 // RepoConfig holds repository configuration
