@@ -728,18 +728,11 @@ func getContainersPath(resourceKind string) []string {
 }
 
 // getWorkloadAnnotations extracts annotations from workload metadata
-// For Deployments, uses spec.template.metadata.annotations
+// For Deployments, uses metadata.annotations (deployment-level)
 // For Pods, uses metadata.annotations
 func getWorkloadAnnotations(obj *unstructured.Unstructured) map[string]string {
-	if obj.GetKind() == kindDeployment {
-		// Get annotations from pod template
-		annotations, found, _ := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
-		if found && annotations != nil {
-			return annotations
-		}
-	}
-
-	// For Pods or fallback, use top-level metadata annotations
+	// Use top-level metadata annotations for all workload types
+	// This follows the pattern of other configuration annotations in the codebase
 	return obj.GetAnnotations()
 }
 
