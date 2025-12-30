@@ -51,6 +51,76 @@ const (
 	kindPod        = "Pod"
 )
 
+// Annotation keys for injection control
+const (
+	AnnotationAutoInject    = "lissto.dev/auto-inject"
+	AnnotationInjectSecrets = "lissto.dev/inject-secrets"
+	AnnotationInjectVars    = "lissto.dev/inject-vars"
+)
+
+// InjectionConfig holds parsed injection configuration from workload annotations
+type InjectionConfig struct {
+	AutoInject bool              // Whether to auto-inject matching declared env vars (default: true)
+	SecretMap  map[string]string // targetEnvName -> sourceSecretKey
+	VarMap     map[string]string // targetEnvName -> sourceVarKey
+}
+
+// parseAutoInject parses the auto-inject annotation value
+// Returns true (default) if annotation is missing or invalid
+func parseAutoInject(value string) bool {
+	if value == "" {
+		return true
+	}
+	return strings.ToLower(value) != "false"
+}
+
+// parseKeyMapping parses a comma-separated key mapping annotation
+// Format: "TARGET=SOURCE,TARGET2=SOURCE2"
+// Returns map of targetEnvName -> sourceKey
+func parseKeyMapping(annotation string) map[string]string {
+	result := make(map[string]string)
+	if annotation == "" {
+		return result
+	}
+
+	pairs := strings.Split(annotation, ",")
+	for _, pair := range pairs {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		target := strings.TrimSpace(parts[0])
+		source := strings.TrimSpace(parts[1])
+		if target != "" && source != "" {
+			result[target] = source
+		}
+	}
+	return result
+}
+
+// extractInjectionConfig extracts injection configuration from workload annotations
+func extractInjectionConfig(annotations map[string]string) InjectionConfig {
+	config := InjectionConfig{
+		AutoInject: true,
+		SecretMap:  make(map[string]string),
+		VarMap:     make(map[string]string),
+	}
+
+	if annotations == nil {
+		return config
+	}
+
+	config.AutoInject = parseAutoInject(annotations[AnnotationAutoInject])
+	config.SecretMap = parseKeyMapping(annotations[AnnotationInjectSecrets])
+	config.VarMap = parseKeyMapping(annotations[AnnotationInjectVars])
+
+	return config
+}
+
 // isReservedEnvVar checks if an env var name is reserved
 // Any variable starting with LISSTO_ is considered reserved
 func isReservedEnvVar(name string) bool {
@@ -496,53 +566,126 @@ func collectExistingEnvNames(existingEnv []interface{}) map[string]bool {
 	return names
 }
 
-// filterEnvByDeclared filters variables/secrets to only those declared in container
-func filterEnvByDeclared(mergedVars map[string]string, resolvedKeys map[string]secretKeySource,
-	existingEnvNames map[string]bool) (map[string]string, map[string]secretKeySource) {
-	filteredVars := make(map[string]string)
-	for key, value := range mergedVars {
-		if existingEnvNames[key] {
-			filteredVars[key] = value
-		}
-	}
-
-	filteredSecrets := make(map[string]secretKeySource)
-	for key, source := range resolvedKeys {
-		if existingEnvNames[key] {
-			filteredSecrets[key] = source
-		}
-	}
-	return filteredVars, filteredSecrets
+// MappedVar represents a variable with target env name and source key
+type MappedVar struct {
+	TargetEnvName string
+	SourceKey     string
+	Value         string
 }
 
-// buildInjectionEnv builds the final env var list with proper hierarchy
-func buildInjectionEnv(existingEnv []interface{}, filteredVars map[string]string,
-	filteredSecrets map[string]secretKeySource, stackSecretName string, metadata StackMetadata,
-	result *ConfigInjectionResult) []interface{} {
-	// Build set of secret keys (highest priority)
-	secretKeys := make(map[string]bool)
-	for key := range filteredSecrets {
-		secretKeys[key] = true
+// MappedSecret represents a secret with target env name and source key
+type MappedSecret struct {
+	TargetEnvName string
+	SourceKey     string
+	Source        secretKeySource
+}
+
+// filterEnvWithConfig filters variables/secrets based on injection config
+// Returns mapped variables, secrets, and warnings for non-existent source keys
+func filterEnvWithConfig(mergedVars map[string]string, resolvedKeys map[string]secretKeySource,
+	existingEnvNames map[string]bool, config InjectionConfig) ([]MappedVar, []MappedSecret, []string) {
+
+	var filteredVars []MappedVar
+	var filteredSecrets []MappedSecret
+	var warnings []string
+
+	// Track which target env names we've already added (to avoid duplicates)
+	addedTargets := make(map[string]bool)
+
+	// First, process explicit mappings (these take priority)
+	// Process variable mappings
+	for targetEnv, sourceKey := range config.VarMap {
+		if isReservedEnvVar(targetEnv) {
+			continue
+		}
+		if value, exists := mergedVars[sourceKey]; exists {
+			filteredVars = append(filteredVars, MappedVar{
+				TargetEnvName: targetEnv,
+				SourceKey:     sourceKey,
+				Value:         value,
+			})
+			addedTargets[targetEnv] = true
+		} else {
+			warnings = append(warnings, fmt.Sprintf("variable mapping %s=%s: source key %q not found in LisstoVariables", targetEnv, sourceKey, sourceKey))
+		}
 	}
 
-	// Build set of all keys to inject
-	keysToInject := make(map[string]bool)
-	for key := range filteredVars {
-		keysToInject[key] = true
+	// Process secret mappings
+	for targetEnv, sourceKey := range config.SecretMap {
+		if isReservedEnvVar(targetEnv) {
+			continue
+		}
+		if source, exists := resolvedKeys[sourceKey]; exists {
+			filteredSecrets = append(filteredSecrets, MappedSecret{
+				TargetEnvName: targetEnv,
+				SourceKey:     sourceKey,
+				Source:        source,
+			})
+			addedTargets[targetEnv] = true
+		} else {
+			warnings = append(warnings, fmt.Sprintf("secret mapping %s=%s: source key %q not found in LisstoSecrets", targetEnv, sourceKey, sourceKey))
+		}
 	}
-	for key := range filteredSecrets {
-		keysToInject[key] = true
+
+	// If auto-inject is enabled, also add declared env vars that match by name
+	if config.AutoInject {
+		// Add secrets first (secrets have higher priority than variables)
+		for key, source := range resolvedKeys {
+			if existingEnvNames[key] && !addedTargets[key] {
+				filteredSecrets = append(filteredSecrets, MappedSecret{
+					TargetEnvName: key,
+					SourceKey:     key,
+					Source:        source,
+				})
+				addedTargets[key] = true
+			}
+		}
+
+		// Add variables that match declared env var names (and not already mapped by secrets)
+		for key, value := range mergedVars {
+			if existingEnvNames[key] && !addedTargets[key] {
+				filteredVars = append(filteredVars, MappedVar{
+					TargetEnvName: key,
+					SourceKey:     key,
+					Value:         value,
+				})
+				addedTargets[key] = true
+			}
+		}
+	}
+
+	return filteredVars, filteredSecrets, warnings
+}
+
+// buildInjectionEnvWithMappings builds the final env var list with mapped variables and secrets
+func buildInjectionEnvWithMappings(existingEnv []interface{}, mappedVars []MappedVar,
+	mappedSecrets []MappedSecret, stackSecretName string, metadata StackMetadata,
+	result *ConfigInjectionResult) []interface{} {
+
+	// Build set of secret target env names (highest priority - secrets override vars)
+	secretTargets := make(map[string]bool)
+	for _, s := range mappedSecrets {
+		secretTargets[s.TargetEnvName] = true
+	}
+
+	// Build set of all target env names to inject
+	targetsToInject := make(map[string]bool)
+	for _, v := range mappedVars {
+		targetsToInject[v.TargetEnvName] = true
+	}
+	for _, s := range mappedSecrets {
+		targetsToInject[s.TargetEnvName] = true
 	}
 
 	// Filter existing env vars (remove conflicts and reserved)
-	filteredEnv := make([]interface{}, 0, len(existingEnv)+len(filteredVars)+len(filteredSecrets)+3)
+	filteredEnv := make([]interface{}, 0, len(existingEnv)+len(mappedVars)+len(mappedSecrets)+3)
 	for _, envVar := range existingEnv {
 		envMap, ok := envVar.(map[string]interface{})
 		if !ok {
 			continue
 		}
 		name, ok := envMap["name"].(string)
-		if !ok || isReservedEnvVar(name) || keysToInject[name] {
+		if !ok || isReservedEnvVar(name) || targetsToInject[name] {
 			continue
 		}
 		filteredEnv = append(filteredEnv, envVar)
@@ -556,22 +699,22 @@ func buildInjectionEnv(existingEnv []interface{}, filteredVars map[string]string
 	)
 	result.MetadataInjected = 3
 
-	// Add variables (skip if also a secret)
-	for key, value := range filteredVars {
-		if secretKeys[key] {
+	// Add variables (skip if target is also a secret)
+	for _, v := range mappedVars {
+		if secretTargets[v.TargetEnvName] {
 			continue
 		}
-		filteredEnv = append(filteredEnv, map[string]interface{}{"name": key, "value": value})
+		filteredEnv = append(filteredEnv, map[string]interface{}{"name": v.TargetEnvName, "value": v.Value})
 		result.VariablesInjected++
 	}
 
-	// Add secret refs
+	// Add secret refs (use SourceKey for secretKeyRef.key, TargetEnvName for env var name)
 	if stackSecretName != "" {
-		for key := range filteredSecrets {
+		for _, s := range mappedSecrets {
 			filteredEnv = append(filteredEnv, map[string]interface{}{
-				"name": key,
+				"name": s.TargetEnvName,
 				"valueFrom": map[string]interface{}{
-					"secretKeyRef": map[string]interface{}{"name": stackSecretName, "key": key},
+					"secretKeyRef": map[string]interface{}{"name": stackSecretName, "key": s.SourceKey},
 				},
 			})
 			result.SecretsInjected++
@@ -589,7 +732,24 @@ func getContainersPath(resourceKind string) []string {
 	return []string{"spec", "containers"}
 }
 
-// injectConfigIntoDeployments injects environment variables and secret refs into deployments
+// getWorkloadAnnotations extracts annotations from workload metadata
+// For Deployments, uses spec.template.metadata.annotations (pod template)
+// because kompose converts docker-compose service labels to pod template annotations
+// For Pods, uses metadata.annotations
+func getWorkloadAnnotations(obj *unstructured.Unstructured) map[string]string {
+	if obj.GetKind() == kindDeployment {
+		// Get annotations from pod template (where kompose places converted labels)
+		annotations, found, _ := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+		if found && annotations != nil {
+			return annotations
+		}
+	}
+
+	// For Pods or fallback, use top-level metadata annotations
+	return obj.GetAnnotations()
+}
+
+// injectConfigIntoWorkloads injects environment variables and secret refs into deployments and pods
 func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects []*unstructured.Unstructured,
 	mergedVars map[string]string, resolvedKeys map[string]secretKeySource, stackSecretName string, metadata StackMetadata) *ConfigInjectionResult {
 	log := logf.FromContext(ctx)
@@ -603,6 +763,17 @@ func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects
 		resourceKind := obj.GetKind()
 		resourceName := obj.GetName()
 		containersPath := getContainersPath(resourceKind)
+
+		// Extract injection config from workload annotations
+		workloadAnnotations := getWorkloadAnnotations(obj)
+		injectionConfig := extractInjectionConfig(workloadAnnotations)
+
+		log.V(1).Info("Extracted injection config",
+			"kind", resourceKind,
+			"name", resourceName,
+			"autoInject", injectionConfig.AutoInject,
+			"secretMappings", len(injectionConfig.SecretMap),
+			"varMappings", len(injectionConfig.VarMap))
 
 		containers, found, err := unstructured.NestedSlice(obj.Object, containersPath...)
 		if err != nil || !found {
@@ -623,8 +794,14 @@ func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects
 			}
 
 			existingEnvNames := collectExistingEnvNames(existingEnv)
-			filteredVars, filteredSecrets := filterEnvByDeclared(mergedVars, resolvedKeys, existingEnvNames)
-			containerMap["env"] = buildInjectionEnv(existingEnv, filteredVars, filteredSecrets, stackSecretName, metadata, result)
+			mappedVars, mappedSecrets, mappingWarnings := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, injectionConfig)
+
+			// Add warnings for non-existent key mappings
+			for _, w := range mappingWarnings {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("%s/%s: %s", resourceKind, resourceName, w))
+			}
+
+			containerMap["env"] = buildInjectionEnvWithMappings(existingEnv, mappedVars, mappedSecrets, stackSecretName, metadata, result)
 			containers[i] = containerMap
 		}
 

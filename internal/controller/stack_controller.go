@@ -190,6 +190,11 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 				"secrets", configResult.SecretsInjected,
 				"metadata", configResult.MetadataInjected,
 				"missingKeys", len(missingSecretKeys))
+
+			// Emit events for config injection warnings (e.g., non-existent key mappings)
+			for _, warning := range configResult.Warnings {
+				r.Recorder.Eventf(stack, corev1.EventTypeWarning, "ConfigInjectionWarning", warning)
+			}
 		}
 	}
 
@@ -562,22 +567,37 @@ func (r *StackReconciler) updateStackStatus(ctx context.Context, stack *envv1alp
 
 	// Handle config injection result
 	if configResult != nil {
-		if len(configResult.MissingSecretKeys) > 0 {
-			// Build warning message for missing keys
-			missingMsg := "Missing secret keys: "
-			keyMsgs := []string{}
-			for secretRef, keys := range configResult.MissingSecretKeys {
-				keyMsgs = append(keyMsgs, fmt.Sprintf("%s[%v]", secretRef, keys))
+		hasMissingKeys := len(configResult.MissingSecretKeys) > 0
+		hasWarnings := len(configResult.Warnings) > 0
+
+		if hasMissingKeys || hasWarnings {
+			// Build warning message
+			var messages []string
+
+			if hasMissingKeys {
+				keyMsgs := []string{}
+				for secretRef, keys := range configResult.MissingSecretKeys {
+					keyMsgs = append(keyMsgs, fmt.Sprintf("%s[%v]", secretRef, keys))
+				}
+				messages = append(messages, "Missing secret keys: "+strings.Join(keyMsgs, ", "))
 			}
-			missingMsg += strings.Join(keyMsgs, ", ")
+
+			if hasWarnings {
+				messages = append(messages, configResult.Warnings...)
+			}
+
+			reason := "ConfigInjectionWarning"
+			if hasMissingKeys {
+				reason = "MissingSecretKeys"
+			}
 
 			conditions = append(conditions, metav1.Condition{
 				Type:               "ConfigInjection",
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: stack.Generation,
 				LastTransitionTime: metav1.Now(),
-				Reason:             "MissingSecretKeys",
-				Message:            missingMsg,
+				Reason:             reason,
+				Message:            strings.Join(messages, "; "),
 			})
 		} else if configResult.VariablesInjected > 0 || configResult.SecretsInjected > 0 {
 			// Config injected successfully
