@@ -427,7 +427,7 @@ var _ = Describe("Reserved Environment Variables", func() {
 			existingEnvNames := map[string]bool{"VAR1": true, "SECRET1": true}
 			config := InjectionConfig{AutoInject: true, SecretMap: map[string]string{}, VarMap: map[string]string{}}
 
-			vars, secrets := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
+			vars, secrets, warnings := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
 
 			Expect(vars).To(HaveLen(1))
 			Expect(vars[0].TargetEnvName).To(Equal("VAR1"))
@@ -435,16 +435,18 @@ var _ = Describe("Reserved Environment Variables", func() {
 			Expect(secrets).To(HaveLen(1))
 			Expect(secrets[0].TargetEnvName).To(Equal("SECRET1"))
 			Expect(secrets[0].SourceKey).To(Equal("SECRET1"))
+			Expect(warnings).To(BeEmpty())
 		})
 
 		It("should not auto-inject when auto-inject is false", func() {
 			existingEnvNames := map[string]bool{"VAR1": true, "SECRET1": true}
 			config := InjectionConfig{AutoInject: false, SecretMap: map[string]string{}, VarMap: map[string]string{}}
 
-			vars, secrets := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
+			vars, secrets, warnings := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
 
 			Expect(vars).To(BeEmpty())
 			Expect(secrets).To(BeEmpty())
+			Expect(warnings).To(BeEmpty())
 		})
 
 		It("should inject mapped keys when auto-inject is false", func() {
@@ -455,7 +457,7 @@ var _ = Describe("Reserved Environment Variables", func() {
 				VarMap:     map[string]string{"MY_VAR": "GLOBAL_VAR"},
 			}
 
-			vars, secrets := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
+			vars, secrets, warnings := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
 
 			Expect(vars).To(HaveLen(1))
 			Expect(vars[0].TargetEnvName).To(Equal("MY_VAR"))
@@ -464,6 +466,7 @@ var _ = Describe("Reserved Environment Variables", func() {
 			Expect(secrets).To(HaveLen(1))
 			Expect(secrets[0].TargetEnvName).To(Equal("MY_SECRET"))
 			Expect(secrets[0].SourceKey).To(Equal("GLOBAL_SECRET"))
+			Expect(warnings).To(BeEmpty())
 		})
 
 		It("should combine auto-inject and mapped keys when auto-inject is true", func() {
@@ -474,12 +477,13 @@ var _ = Describe("Reserved Environment Variables", func() {
 				VarMap:     map[string]string{},
 			}
 
-			vars, secrets := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
+			vars, secrets, warnings := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
 
 			Expect(vars).To(HaveLen(1))
 			Expect(vars[0].TargetEnvName).To(Equal("VAR1"))
 			Expect(secrets).To(HaveLen(1))
 			Expect(secrets[0].TargetEnvName).To(Equal("MY_SECRET"))
+			Expect(warnings).To(BeEmpty())
 		})
 
 		It("should skip reserved env var names in mappings", func() {
@@ -490,24 +494,30 @@ var _ = Describe("Reserved Environment Variables", func() {
 				VarMap:     map[string]string{"LISSTO_VAR": "GLOBAL_VAR"},
 			}
 
-			vars, secrets := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
+			vars, secrets, warnings := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
 
 			Expect(vars).To(BeEmpty())
 			Expect(secrets).To(BeEmpty())
+			Expect(warnings).To(BeEmpty())
 		})
 
-		It("should skip mappings for non-existent source keys", func() {
+		It("should return warnings for non-existent source keys", func() {
 			existingEnvNames := map[string]bool{}
 			config := InjectionConfig{
 				AutoInject: false,
-				SecretMap:  map[string]string{"MY_SECRET": "NON_EXISTENT"},
-				VarMap:     map[string]string{"MY_VAR": "NON_EXISTENT"},
+				SecretMap:  map[string]string{"MY_SECRET": "NON_EXISTENT_SECRET"},
+				VarMap:     map[string]string{"MY_VAR": "NON_EXISTENT_VAR"},
 			}
 
-			vars, secrets := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
+			vars, secrets, warnings := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
 
 			Expect(vars).To(BeEmpty())
 			Expect(secrets).To(BeEmpty())
+			Expect(warnings).To(HaveLen(2))
+			Expect(warnings).To(ContainElement(ContainSubstring("variable mapping MY_VAR=NON_EXISTENT_VAR")))
+			Expect(warnings).To(ContainElement(ContainSubstring("source key \"NON_EXISTENT_VAR\" not found")))
+			Expect(warnings).To(ContainElement(ContainSubstring("secret mapping MY_SECRET=NON_EXISTENT_SECRET")))
+			Expect(warnings).To(ContainElement(ContainSubstring("source key \"NON_EXISTENT_SECRET\" not found")))
 		})
 
 		It("should not duplicate when mapping target equals auto-inject key", func() {
@@ -518,13 +528,14 @@ var _ = Describe("Reserved Environment Variables", func() {
 				SecretMap:  map[string]string{},
 			}
 
-			vars, _ := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
+			vars, _, warnings := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, config)
 
 			// Should have only one VAR1, from the mapping (not auto-inject)
 			Expect(vars).To(HaveLen(1))
 			Expect(vars[0].TargetEnvName).To(Equal("VAR1"))
 			Expect(vars[0].SourceKey).To(Equal("GLOBAL_VAR"))
 			Expect(vars[0].Value).To(Equal("global_value"))
+			Expect(warnings).To(BeEmpty())
 		})
 	})
 })

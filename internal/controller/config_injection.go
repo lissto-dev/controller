@@ -581,12 +581,13 @@ type MappedSecret struct {
 }
 
 // filterEnvWithConfig filters variables/secrets based on injection config
-// Returns mapped variables and secrets ready for injection
+// Returns mapped variables, secrets, and warnings for non-existent source keys
 func filterEnvWithConfig(mergedVars map[string]string, resolvedKeys map[string]secretKeySource,
-	existingEnvNames map[string]bool, config InjectionConfig) ([]MappedVar, []MappedSecret) {
+	existingEnvNames map[string]bool, config InjectionConfig) ([]MappedVar, []MappedSecret, []string) {
 
 	var filteredVars []MappedVar
 	var filteredSecrets []MappedSecret
+	var warnings []string
 
 	// Track which target env names we've already added (to avoid duplicates)
 	addedTargets := make(map[string]bool)
@@ -604,6 +605,8 @@ func filterEnvWithConfig(mergedVars map[string]string, resolvedKeys map[string]s
 				Value:         value,
 			})
 			addedTargets[targetEnv] = true
+		} else {
+			warnings = append(warnings, fmt.Sprintf("variable mapping %s=%s: source key %q not found in LisstoVariables", targetEnv, sourceKey, sourceKey))
 		}
 	}
 
@@ -619,6 +622,8 @@ func filterEnvWithConfig(mergedVars map[string]string, resolvedKeys map[string]s
 				Source:        source,
 			})
 			addedTargets[targetEnv] = true
+		} else {
+			warnings = append(warnings, fmt.Sprintf("secret mapping %s=%s: source key %q not found in LisstoSecrets", targetEnv, sourceKey, sourceKey))
 		}
 	}
 
@@ -649,7 +654,7 @@ func filterEnvWithConfig(mergedVars map[string]string, resolvedKeys map[string]s
 		}
 	}
 
-	return filteredVars, filteredSecrets
+	return filteredVars, filteredSecrets, warnings
 }
 
 // buildInjectionEnvWithMappings builds the final env var list with mapped variables and secrets
@@ -789,7 +794,13 @@ func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects
 			}
 
 			existingEnvNames := collectExistingEnvNames(existingEnv)
-			mappedVars, mappedSecrets := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, injectionConfig)
+			mappedVars, mappedSecrets, mappingWarnings := filterEnvWithConfig(mergedVars, resolvedKeys, existingEnvNames, injectionConfig)
+
+			// Add warnings for non-existent key mappings
+			for _, w := range mappingWarnings {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("%s/%s: %s", resourceKind, resourceName, w))
+			}
+
 			containerMap["env"] = buildInjectionEnvWithMappings(existingEnv, mappedVars, mappedSecrets, stackSecretName, metadata, result)
 			containers[i] = containerMap
 		}
