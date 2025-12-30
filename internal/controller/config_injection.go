@@ -743,32 +743,6 @@ func getWorkloadAnnotations(obj *unstructured.Unstructured) map[string]string {
 	return obj.GetAnnotations()
 }
 
-// collectMappedSourceKeys collects all source keys that need to be copied to the stack secret
-// This includes both auto-injected keys and explicitly mapped keys
-func collectMappedSourceKeys(resolvedKeys map[string]secretKeySource, config InjectionConfig,
-	existingEnvNames map[string]bool) map[string]secretKeySource {
-
-	result := make(map[string]secretKeySource)
-
-	// Add explicitly mapped source keys
-	for _, sourceKey := range config.SecretMap {
-		if source, exists := resolvedKeys[sourceKey]; exists {
-			result[sourceKey] = source
-		}
-	}
-
-	// If auto-inject is enabled, add keys that match declared env vars
-	if config.AutoInject {
-		for key, source := range resolvedKeys {
-			if existingEnvNames[key] {
-				result[key] = source
-			}
-		}
-	}
-
-	return result
-}
-
 // injectConfigIntoWorkloads injects environment variables and secret refs into deployments and pods
 func (r *StackReconciler) injectConfigIntoWorkloads(ctx context.Context, objects []*unstructured.Unstructured,
 	mergedVars map[string]string, resolvedKeys map[string]secretKeySource, stackSecretName string, metadata StackMetadata) *ConfigInjectionResult {
