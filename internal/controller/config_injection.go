@@ -624,25 +624,25 @@ func filterEnvWithConfig(mergedVars map[string]string, resolvedKeys map[string]s
 
 	// If auto-inject is enabled, also add declared env vars that match by name
 	if config.AutoInject {
-		// Add variables that match declared env var names (and not already mapped)
-		for key, value := range mergedVars {
-			if existingEnvNames[key] && !addedTargets[key] {
-				filteredVars = append(filteredVars, MappedVar{
-					TargetEnvName: key,
-					SourceKey:     key,
-					Value:         value,
-				})
-				addedTargets[key] = true
-			}
-		}
-
-		// Add secrets that match declared env var names (and not already mapped)
+		// Add secrets first (secrets have higher priority than variables)
 		for key, source := range resolvedKeys {
 			if existingEnvNames[key] && !addedTargets[key] {
 				filteredSecrets = append(filteredSecrets, MappedSecret{
 					TargetEnvName: key,
 					SourceKey:     key,
 					Source:        source,
+				})
+				addedTargets[key] = true
+			}
+		}
+
+		// Add variables that match declared env var names (and not already mapped by secrets)
+		for key, value := range mergedVars {
+			if existingEnvNames[key] && !addedTargets[key] {
+				filteredVars = append(filteredVars, MappedVar{
+					TargetEnvName: key,
+					SourceKey:     key,
+					Value:         value,
 				})
 				addedTargets[key] = true
 			}
