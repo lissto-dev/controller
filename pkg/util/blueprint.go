@@ -21,9 +21,11 @@ import "strings"
 // ParseBlueprintReference parses blueprint reference in format:
 // - "name" -> uses defaultNamespace
 // - "global/name" -> uses globalNamespace
-// - "scope/name" -> resolves scope to namespace
+// - "scope/name" -> resolves scope to namespace using developerPrefix
 //
 // Returns the resolved namespace and blueprint name.
+// This is a convenience wrapper that doesn't require a namespace.Manager.
+// For more advanced namespace operations, use the namespace package directly.
 func ParseBlueprintReference(ref, defaultNamespace, globalNamespace string) (namespace, name string) {
 	namespace = defaultNamespace
 	name = ref
@@ -36,7 +38,9 @@ func ParseBlueprintReference(ref, defaultNamespace, globalNamespace string) (nam
 		if scope == "global" {
 			namespace = globalNamespace
 		}
-		// Can be extended for other scopes in the future
+		// Note: For developer scopes like "daniel/blueprint", the caller should
+		// use namespace.Manager.ParseScopedIDWithDefault() which properly handles
+		// the developer prefix conversion.
 	}
 
 	return namespace, name
