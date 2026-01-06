@@ -4,7 +4,7 @@
 resources:
 - bases/env.lissto.dev_stacks.yaml
 - bases/env.lissto.dev_blueprints.yaml
-- bases/env.lissto.dev_stacklifecycles.yaml
+- bases/env.lissto.dev_lifecycles.yaml
 - bases/env.lissto.dev_envs.yaml
 - bases/env.lissto.dev_lisstovariables.yaml
 - bases/env.lissto.dev_lisstosecrets.yaml
