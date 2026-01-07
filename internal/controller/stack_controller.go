@@ -19,7 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
+	"math"
 	"strings"
 	"time"
 
@@ -31,7 +31,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,20 +45,13 @@ import (
 const (
 	stackFinalizerName = "stack.lissto.dev/config-cleanup"
 
-	// Annotation to track deletion retry count for exponential backoff
-	deletionRetryCountAnnotation = "lissto.dev/deletion-retry-count"
-
 	// Deletion timeout after which we mark as failed (but continue retrying)
 	deletionTimeout = 5 * time.Minute
-)
 
-// deletionBackoff defines exponential backoff for deletion retries (5s base, 2x factor, 5min cap)
-var deletionBackoff = wait.Backoff{
-	Duration: 5 * time.Second,
-	Factor:   2.0,
-	Steps:    100, // Effectively unlimited steps
-	Cap:      5 * time.Minute,
-}
+	// Deletion backoff parameters
+	deletionBackoffBase = 5 * time.Second
+	deletionBackoffMax  = 5 * time.Minute
+)
 
 // StackReconciler reconciles a Stack object
 type StackReconciler struct {
@@ -798,26 +790,20 @@ func (r *StackReconciler) handleStackDeletion(ctx context.Context, stack *envv1a
 		return ctrl.Result{}, err
 	}
 
-	// Count remaining owned resources using label selector
-	remaining, err := r.countOwnedResources(ctx, stack)
-	if err != nil {
-		log.Error(err, "Failed to count owned resources")
-		return ctrl.Result{}, err
-	}
-
-	// If no resources remain, complete deletion
+	// Get remaining resources from status conditions + label verification
+	remaining := r.getRemainingResources(ctx, stack)
 	if len(remaining) == 0 {
 		return r.completeDeletion(ctx, stack)
 	}
 
-	// Get retry count and calculate backoff using standard K8s library
-	retryCount := r.getAnnotationInt(stack, deletionRetryCountAnnotation)
-	backoff := getBackoffDuration(deletionBackoff, retryCount)
-	timedOut := time.Since(stack.DeletionTimestamp.Time) >= deletionTimeout
+	// Calculate backoff from elapsed time (no annotation needed)
+	elapsed := time.Since(stack.DeletionTimestamp.Time)
+	backoff := calculateBackoffFromElapsed(elapsed)
+	timedOut := elapsed >= deletionTimeout
 	resourceList := formatResourceList(remaining)
 
 	// Emit events on state transitions
-	r.emitDeletionEvent(stack, retryCount, timedOut, len(remaining), resourceList)
+	r.emitDeletionEvent(stack, timedOut, len(remaining), resourceList)
 
 	// Update status condition
 	r.setDeletionCondition(stack, timedOut, len(remaining), resourceList)
@@ -825,70 +811,98 @@ func (r *StackReconciler) handleStackDeletion(ctx context.Context, stack *envv1a
 		return ctrl.Result{}, err
 	}
 
-	// Increment retry count
-	if err := r.setAnnotationInt(ctx, stack, deletionRetryCountAnnotation, retryCount+1); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	log.Info("Waiting for child resources", "remaining", len(remaining), "timedOut", timedOut, "nextRetry", backoff)
+	log.Info("Waiting for child resources", "remaining", len(remaining), "elapsed", elapsed, "nextRetry", backoff)
 	return ctrl.Result{RequeueAfter: backoff}, nil
 }
 
-// managedResourceTypes returns factory functions for resource types managed by the controller.
-// Add new types here to include them in deletion protection.
-func managedResourceTypes() []func() (string, client.ObjectList) {
-	return []func() (string, client.ObjectList){
-		func() (string, client.ObjectList) { return "Deployment", &appsv1.DeploymentList{} },
-		func() (string, client.ObjectList) { return "Service", &corev1.ServiceList{} },
-		func() (string, client.ObjectList) { return "Ingress", &networkingv1.IngressList{} },
-		func() (string, client.ObjectList) {
-			return "PersistentVolumeClaim", &corev1.PersistentVolumeClaimList{}
-		},
-		func() (string, client.ObjectList) { return "Secret", &corev1.SecretList{} },
-		func() (string, client.ObjectList) { return "Pod", &corev1.PodList{} },
-	}
-}
-
-// countOwnedResources returns resources owned by the Stack (via label or owner ref).
-func (r *StackReconciler) countOwnedResources(ctx context.Context, stack *envv1alpha1.Stack) ([]string, error) {
-	var remaining []string
+// getRemainingResources returns resources that still exist, using status conditions as primary
+// source and label selector as verification to catch any leftovers.
+func (r *StackReconciler) getRemainingResources(ctx context.Context, stack *envv1alpha1.Stack) []string {
+	remaining := make([]string, 0, len(stack.Status.Conditions))
 	seen := make(map[string]bool)
 
-	for _, factory := range managedResourceTypes() {
-		kind, list := factory()
-		if err := r.List(ctx, list, client.InNamespace(stack.Namespace)); err != nil {
-			return nil, err
+	// Primary: Check resources tracked in status conditions (Resource-{kind}-{name} format)
+	for _, cond := range stack.Status.Conditions {
+		if !strings.HasPrefix(cond.Type, "Resource-") {
+			continue
 		}
-		items, _ := meta.ExtractList(list)
-		for _, item := range items {
-			obj, ok := item.(client.Object)
-			if !ok {
-				continue
-			}
-			key := fmt.Sprintf("%s/%s", kind, obj.GetName())
-			if seen[key] {
-				continue
-			}
-			if r.isOwnedByStack(obj, stack) {
-				remaining = append(remaining, key)
-				seen[key] = true
-			}
+		parts := strings.SplitN(strings.TrimPrefix(cond.Type, "Resource-"), "-", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		kind, name := parts[0], parts[1]
+		key := fmt.Sprintf("%s/%s", kind, name)
+		if seen[key] || !r.resourceExists(ctx, stack.Namespace, kind, name) {
+			continue
+		}
+		remaining = append(remaining, key)
+		seen[key] = true
+	}
+
+	// Verification: Also check for any resources with stack label (catches leftovers)
+	for _, key := range r.findLabeledResources(ctx, stack) {
+		if !seen[key] {
+			remaining = append(remaining, key)
+			seen[key] = true
 		}
 	}
-	return remaining, nil
+	return remaining
 }
 
-// isOwnedByStack checks if a resource is owned by the Stack via label or owner reference.
-func (r *StackReconciler) isOwnedByStack(obj client.Object, stack *envv1alpha1.Stack) bool {
-	if labels := obj.GetLabels(); labels != nil && labels["lissto.dev/stack"] == stack.Name {
-		return true
+// resourceExists checks if a resource of the given kind/name exists in the namespace.
+func (r *StackReconciler) resourceExists(ctx context.Context, namespace, kind, name string) bool {
+	var obj client.Object
+	switch strings.ToLower(kind) {
+	case "deployment":
+		obj = &appsv1.Deployment{}
+	case "service":
+		obj = &corev1.Service{}
+	case "ingress":
+		obj = &networkingv1.Ingress{}
+	case "persistentvolumeclaim":
+		obj = &corev1.PersistentVolumeClaim{}
+	case "secret":
+		obj = &corev1.Secret{}
+	case "pod":
+		obj = &corev1.Pod{}
+	default:
+		return false
 	}
-	for _, ref := range obj.GetOwnerReferences() {
-		if ref.UID == stack.UID {
-			return true
+	return r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, obj) == nil
+}
+
+// findLabeledResources finds all resources with the stack label (for verification).
+func (r *StackReconciler) findLabeledResources(ctx context.Context, stack *envv1alpha1.Stack) []string {
+	var resources []string
+	listOpts := []client.ListOption{
+		client.InNamespace(stack.Namespace),
+		client.MatchingLabels{"lissto.dev/stack": stack.Name},
+	}
+
+	types := []struct {
+		kind string
+		list client.ObjectList
+	}{
+		{"Deployment", &appsv1.DeploymentList{}},
+		{"Service", &corev1.ServiceList{}},
+		{"Ingress", &networkingv1.IngressList{}},
+		{"PersistentVolumeClaim", &corev1.PersistentVolumeClaimList{}},
+		{"Secret", &corev1.SecretList{}},
+		{"Pod", &corev1.PodList{}},
+	}
+
+	for _, t := range types {
+		if err := r.List(ctx, t.list, listOpts...); err != nil {
+			continue
+		}
+		items, _ := meta.ExtractList(t.list)
+		for _, item := range items {
+			if obj, ok := item.(client.Object); ok {
+				resources = append(resources, fmt.Sprintf("%s/%s", t.kind, obj.GetName()))
+			}
 		}
 	}
-	return false
+	return resources
 }
 
 // completeDeletion removes the finalizer and emits completion event.
@@ -899,10 +913,7 @@ func (r *StackReconciler) completeDeletion(ctx context.Context, stack *envv1alph
 		r.Recorder.Event(stack, corev1.EventTypeNormal, "DeletionComplete", "All child resources deleted")
 	}
 
-	// Remove finalizer and clear retry annotation
 	controllerutil.RemoveFinalizer(stack, stackFinalizerName)
-	delete(stack.Annotations, deletionRetryCountAnnotation)
-
 	if err := r.Update(ctx, stack); err != nil {
 		log.Error(err, "Failed to remove finalizer")
 		return ctrl.Result{}, err
@@ -913,16 +924,16 @@ func (r *StackReconciler) completeDeletion(ctx context.Context, stack *envv1alph
 }
 
 // emitDeletionEvent emits appropriate events for deletion state transitions.
-func (r *StackReconciler) emitDeletionEvent(stack *envv1alpha1.Stack, retryCount int, timedOut bool, remaining int, resourceList string) {
+func (r *StackReconciler) emitDeletionEvent(stack *envv1alpha1.Stack, timedOut bool, remaining int, resourceList string) {
 	if r.Recorder == nil {
 		return
 	}
 	existing := meta.FindStatusCondition(stack.Status.Conditions, envv1alpha1.StackConditionTypeDeleting)
 
-	if retryCount == 0 {
+	if existing == nil {
 		r.Recorder.Event(stack, corev1.EventTypeNormal, "DeletionStarted",
 			fmt.Sprintf("Waiting for %d child resource(s)", remaining))
-	} else if timedOut && (existing == nil || existing.Reason != envv1alpha1.StackReasonDeletionFailed) {
+	} else if timedOut && existing.Reason != envv1alpha1.StackReasonDeletionFailed {
 		r.Recorder.Event(stack, corev1.EventTypeWarning, "DeletionTimedOut",
 			fmt.Sprintf("Timed out after %v. Blocked by: %s", deletionTimeout, resourceList))
 	}
@@ -947,35 +958,19 @@ func (r *StackReconciler) setDeletionCondition(stack *envv1alpha1.Stack, timedOu
 	})
 }
 
-// getAnnotationInt returns an integer annotation value, defaulting to 0.
-func (r *StackReconciler) getAnnotationInt(stack *envv1alpha1.Stack, key string) int {
-	if stack.Annotations == nil {
-		return 0
+// calculateBackoffFromElapsed calculates exponential backoff based on elapsed time.
+// Uses 5s base with 2x factor, capped at 5min. No state tracking needed.
+func calculateBackoffFromElapsed(elapsed time.Duration) time.Duration {
+	if elapsed <= 0 {
+		return deletionBackoffBase
 	}
-	if v, err := strconv.Atoi(stack.Annotations[key]); err == nil {
-		return v
+	// Calculate step based on elapsed time: step = log2(elapsed/base + 1)
+	steps := int(math.Log2(float64(elapsed)/float64(deletionBackoffBase) + 1))
+	backoff := deletionBackoffBase * time.Duration(1<<steps)
+	if backoff > deletionBackoffMax {
+		return deletionBackoffMax
 	}
-	return 0
-}
-
-// setAnnotationInt sets an integer annotation and updates the resource.
-func (r *StackReconciler) setAnnotationInt(ctx context.Context, stack *envv1alpha1.Stack, key string, value int) error {
-	if stack.Annotations == nil {
-		stack.Annotations = make(map[string]string)
-	}
-	stack.Annotations[key] = strconv.Itoa(value)
-	return r.Update(ctx, stack)
-}
-
-// getBackoffDuration calculates backoff duration for a given retry count using wait.Backoff.
-func getBackoffDuration(b wait.Backoff, retryCount int) time.Duration {
-	// Create a copy to avoid mutating the original
-	backoff := b
-	var duration time.Duration
-	for i := 0; i <= retryCount; i++ {
-		duration = backoff.Step()
-	}
-	return duration
+	return backoff
 }
 
 // formatResourceList formats resources into a comma-separated string, truncating if needed.

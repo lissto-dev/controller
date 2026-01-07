@@ -25,6 +25,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -509,17 +510,22 @@ var _ = Describe("Stack Deletion Protection", func() {
 		})
 	})
 
-	Context("getBackoffDuration", func() {
-		It("should use exponential backoff from wait.Backoff", func() {
-			// Uses standard K8s wait.Backoff - just verify it increases
-			b0 := getBackoffDuration(deletionBackoff, 0)
-			b1 := getBackoffDuration(deletionBackoff, 1)
-			b2 := getBackoffDuration(deletionBackoff, 2)
-			Expect(b1).To(BeNumerically(">", b0))
-			Expect(b2).To(BeNumerically(">", b1))
+	Context("calculateBackoffFromElapsed", func() {
+		It("should use exponential backoff based on elapsed time", func() {
+			// Verify backoff increases with elapsed time
+			b0 := calculateBackoffFromElapsed(0)
+			b5s := calculateBackoffFromElapsed(5 * time.Second)
+			b15s := calculateBackoffFromElapsed(15 * time.Second)
+			b35s := calculateBackoffFromElapsed(35 * time.Second)
+
+			Expect(b0).To(Equal(5 * time.Second))
+			Expect(b5s).To(BeNumerically(">=", b0))
+			Expect(b15s).To(BeNumerically(">=", b5s))
+			Expect(b35s).To(BeNumerically(">=", b15s))
+
 			// Verify cap at 5 minutes
-			b100 := getBackoffDuration(deletionBackoff, 100)
-			Expect(b100).To(Equal(5 * time.Minute))
+			b10m := calculateBackoffFromElapsed(10 * time.Minute)
+			Expect(b10m).To(Equal(5 * time.Minute))
 		})
 	})
 
@@ -609,20 +615,13 @@ var _ = Describe("Stack Deletion Protection", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
 			Expect(stack.Finalizers).To(ContainElement(stackFinalizerName))
 
-			By("Creating a child Pod with a finalizer (to prevent immediate deletion)")
+			By("Creating a child Pod with a finalizer and stack label (to prevent immediate deletion)")
 			childPod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       stackName + "-child-pod",
 					Namespace:  namespace,
 					Finalizers: []string{"test.lissto.dev/block-deletion"},
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							APIVersion: "env.lissto.dev/v1alpha1",
-							Kind:       "Stack",
-							Name:       stack.Name,
-							UID:        stack.UID,
-						},
-					},
+					Labels:     map[string]string{"lissto.dev/stack": stackName},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -667,7 +666,7 @@ var _ = Describe("Stack Deletion Protection", func() {
 			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "Stack should be deleted after child resources are gone")
 		})
 
-		It("should update retry count annotation on each reconcile", func() {
+		It("should set Deleting condition on each reconcile", func() {
 			By("Creating a Stack and reconciling it")
 			stack := testdata.NewStack(namespace, stackName, "default/deletion-test-blueprint", "deletion-test-manifests")
 			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
@@ -685,14 +684,7 @@ var _ = Describe("Stack Deletion Protection", func() {
 					Name:       stackName + "-retry-test-pod",
 					Namespace:  namespace,
 					Finalizers: []string{"test.lissto.dev/block-deletion"},
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							APIVersion: "env.lissto.dev/v1alpha1",
-							Kind:       "Stack",
-							Name:       stack.Name,
-							UID:        stack.UID,
-						},
-					},
+					Labels:     map[string]string{"lissto.dev/stack": stackName},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -705,19 +697,14 @@ var _ = Describe("Stack Deletion Protection", func() {
 			By("Deleting the Stack")
 			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
 
-			By("First reconcile - retry count should be 1")
+			By("First reconcile - should set Deleting condition")
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
-			Expect(stack.Annotations[deletionRetryCountAnnotation]).To(Equal("1"))
-
-			By("Second reconcile - retry count should be 2")
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
-
-			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
-			Expect(stack.Annotations[deletionRetryCountAnnotation]).To(Equal("2"))
+			deletingCond := meta.FindStatusCondition(stack.Status.Conditions, envv1alpha1.StackConditionTypeDeleting)
+			Expect(deletingCond).NotTo(BeNil())
+			Expect(deletingCond.Reason).To(Equal(envv1alpha1.StackReasonWaitingForChildren))
 
 			// Cleanup - remove finalizer from pod
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: childPod.Name, Namespace: namespace}, childPod)).To(Succeed())
@@ -725,7 +712,7 @@ var _ = Describe("Stack Deletion Protection", func() {
 			_ = k8sClient.Update(ctx, childPod)
 		})
 
-		It("should increase backoff exponentially", func() {
+		It("should return requeue with backoff when resources remain", func() {
 			By("Creating a Stack and reconciling it")
 			stack := testdata.NewStack(namespace, stackName, "default/deletion-test-blueprint", "deletion-test-manifests")
 			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
@@ -743,14 +730,7 @@ var _ = Describe("Stack Deletion Protection", func() {
 					Name:       stackName + "-backoff-test-pod",
 					Namespace:  namespace,
 					Finalizers: []string{"test.lissto.dev/block-deletion"},
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							APIVersion: "env.lissto.dev/v1alpha1",
-							Kind:       "Stack",
-							Name:       stack.Name,
-							UID:        stack.UID,
-						},
-					},
+					Labels:     map[string]string{"lissto.dev/stack": stackName},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -763,20 +743,12 @@ var _ = Describe("Stack Deletion Protection", func() {
 			By("Deleting the Stack")
 			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
 
-			By("First reconcile - backoff should be 5s")
+			By("Reconcile - should return requeue with backoff")
 			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(5 * time.Second))
-
-			By("Second reconcile - backoff should be 10s")
-			result, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(10 * time.Second))
-
-			By("Third reconcile - backoff should be 20s")
-			result, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(20 * time.Second))
+			// Backoff is calculated from elapsed time, should be at least base (5s)
+			Expect(result.RequeueAfter).To(BeNumerically(">=", 5*time.Second))
+			Expect(result.RequeueAfter).To(BeNumerically("<=", 5*time.Minute))
 
 			// Cleanup - remove finalizer from pod
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: childPod.Name, Namespace: namespace}, childPod)).To(Succeed())
