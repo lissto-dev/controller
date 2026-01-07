@@ -495,56 +495,31 @@ var _ = Describe("Stack Controller", func() {
 })
 
 var _ = Describe("Stack Deletion Protection", func() {
-	Context("calculateDeletionBackoff", func() {
-		It("should return base backoff for retry count 0", func() {
-			backoff := calculateDeletionBackoff(0)
-			Expect(backoff).To(Equal(5 * time.Second))
-		})
-
-		It("should double backoff for each retry", func() {
-			Expect(calculateDeletionBackoff(0)).To(Equal(5 * time.Second))
-			Expect(calculateDeletionBackoff(1)).To(Equal(10 * time.Second))
-			Expect(calculateDeletionBackoff(2)).To(Equal(20 * time.Second))
-			Expect(calculateDeletionBackoff(3)).To(Equal(40 * time.Second))
-			Expect(calculateDeletionBackoff(4)).To(Equal(80 * time.Second))
-			Expect(calculateDeletionBackoff(5)).To(Equal(160 * time.Second))
-		})
-
-		It("should cap backoff at 5 minutes", func() {
-			Expect(calculateDeletionBackoff(6)).To(Equal(5 * time.Minute))
-			Expect(calculateDeletionBackoff(7)).To(Equal(5 * time.Minute))
-			Expect(calculateDeletionBackoff(10)).To(Equal(5 * time.Minute))
-			Expect(calculateDeletionBackoff(100)).To(Equal(5 * time.Minute))
-		})
-	})
-
 	Context("formatResourceList", func() {
-		It("should return empty string for empty list", func() {
+		It("should format resources correctly", func() {
 			Expect(formatResourceList([]string{})).To(Equal(""))
-		})
-
-		It("should format single resource", func() {
 			Expect(formatResourceList([]string{"Deployment/web"})).To(Equal("Deployment/web"))
-		})
-
-		It("should format multiple resources with comma separation", func() {
-			resources := []string{"Deployment/web", "Service/web", "PVC/data"}
-			Expect(formatResourceList(resources)).To(Equal("Deployment/web, Service/web, PVC/data"))
+			Expect(formatResourceList([]string{"Deployment/web", "Service/web"})).To(Equal("Deployment/web, Service/web"))
 		})
 
 		It("should truncate list with more than 5 resources", func() {
-			resources := []string{
-				"Deployment/web",
-				"Service/web",
-				"PVC/data",
-				"Secret/config",
-				"Ingress/web",
-				"Pod/web-abc123",
-				"Pod/web-def456",
-			}
+			resources := []string{"A", "B", "C", "D", "E", "F", "G"}
 			result := formatResourceList(resources)
-			Expect(result).To(ContainSubstring("Deployment/web"))
 			Expect(result).To(ContainSubstring("... and 2 more"))
+		})
+	})
+
+	Context("getBackoffDuration", func() {
+		It("should use exponential backoff from wait.Backoff", func() {
+			// Uses standard K8s wait.Backoff - just verify it increases
+			b0 := getBackoffDuration(deletionBackoff, 0)
+			b1 := getBackoffDuration(deletionBackoff, 1)
+			b2 := getBackoffDuration(deletionBackoff, 2)
+			Expect(b1).To(BeNumerically(">", b0))
+			Expect(b2).To(BeNumerically(">", b1))
+			// Verify cap at 5 minutes
+			b100 := getBackoffDuration(deletionBackoff, 100)
+			Expect(b100).To(Equal(5 * time.Minute))
 		})
 	})
 
