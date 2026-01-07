@@ -834,82 +834,61 @@ func (r *StackReconciler) handleStackDeletion(ctx context.Context, stack *envv1a
 	return ctrl.Result{RequeueAfter: backoff}, nil
 }
 
-// countOwnedResources returns resources owned by the Stack (via owner ref or label).
+// managedResourceTypes returns factory functions for resource types managed by the controller.
+// Add new types here to include them in deletion protection.
+func managedResourceTypes() []func() (string, client.ObjectList) {
+	return []func() (string, client.ObjectList){
+		func() (string, client.ObjectList) { return "Deployment", &appsv1.DeploymentList{} },
+		func() (string, client.ObjectList) { return "Service", &corev1.ServiceList{} },
+		func() (string, client.ObjectList) { return "Ingress", &networkingv1.IngressList{} },
+		func() (string, client.ObjectList) {
+			return "PersistentVolumeClaim", &corev1.PersistentVolumeClaimList{}
+		},
+		func() (string, client.ObjectList) { return "Secret", &corev1.SecretList{} },
+		func() (string, client.ObjectList) { return "Pod", &corev1.PodList{} },
+	}
+}
+
+// countOwnedResources returns resources owned by the Stack (via label or owner ref).
 func (r *StackReconciler) countOwnedResources(ctx context.Context, stack *envv1alpha1.Stack) ([]string, error) {
 	var remaining []string
+	seen := make(map[string]bool)
 
-	// Use label selector to find all resources with lissto.dev/stack=<stackName>
-	labelSelector := client.MatchingLabels{"lissto.dev/stack": stack.Name}
-	listOpts := []client.ListOption{client.InNamespace(stack.Namespace), labelSelector}
-
-	// Check each resource type - these are the types we manage
-	resourceTypes := []struct {
-		kind string
-		list client.ObjectList
-	}{
-		{"Deployment", &appsv1.DeploymentList{}},
-		{"Service", &corev1.ServiceList{}},
-		{"Ingress", &networkingv1.IngressList{}},
-		{"PersistentVolumeClaim", &corev1.PersistentVolumeClaimList{}},
-		{"Secret", &corev1.SecretList{}},
-		{"Pod", &corev1.PodList{}},
-	}
-
-	for _, rt := range resourceTypes {
-		if err := r.List(ctx, rt.list, listOpts...); err != nil {
+	for _, factory := range managedResourceTypes() {
+		kind, list := factory()
+		if err := r.List(ctx, list, client.InNamespace(stack.Namespace)); err != nil {
 			return nil, err
 		}
-		items, _ := meta.ExtractList(rt.list)
-		for _, item := range items {
-			if obj, ok := item.(client.Object); ok {
-				remaining = append(remaining, fmt.Sprintf("%s/%s", rt.kind, obj.GetName()))
-			}
-		}
-	}
-
-	// Also check for resources with owner reference but no label (edge case)
-	for _, rt := range resourceTypes {
-		var unlabeled client.ObjectList
-		switch rt.list.(type) {
-		case *appsv1.DeploymentList:
-			unlabeled = &appsv1.DeploymentList{}
-		case *corev1.ServiceList:
-			unlabeled = &corev1.ServiceList{}
-		case *networkingv1.IngressList:
-			unlabeled = &networkingv1.IngressList{}
-		case *corev1.PersistentVolumeClaimList:
-			unlabeled = &corev1.PersistentVolumeClaimList{}
-		case *corev1.SecretList:
-			unlabeled = &corev1.SecretList{}
-		case *corev1.PodList:
-			unlabeled = &corev1.PodList{}
-		default:
-			continue
-		}
-		if err := r.List(ctx, unlabeled, client.InNamespace(stack.Namespace)); err != nil {
-			continue
-		}
-		items, _ := meta.ExtractList(unlabeled)
+		items, _ := meta.ExtractList(list)
 		for _, item := range items {
 			obj, ok := item.(client.Object)
 			if !ok {
 				continue
 			}
-			// Skip if already counted via label
-			if labels := obj.GetLabels(); labels != nil && labels["lissto.dev/stack"] == stack.Name {
+			key := fmt.Sprintf("%s/%s", kind, obj.GetName())
+			if seen[key] {
 				continue
 			}
-			// Check owner reference
-			for _, ref := range obj.GetOwnerReferences() {
-				if ref.UID == stack.UID {
-					remaining = append(remaining, fmt.Sprintf("%s/%s", rt.kind, obj.GetName()))
-					break
-				}
+			if r.isOwnedByStack(obj, stack) {
+				remaining = append(remaining, key)
+				seen[key] = true
 			}
 		}
 	}
-
 	return remaining, nil
+}
+
+// isOwnedByStack checks if a resource is owned by the Stack via label or owner reference.
+func (r *StackReconciler) isOwnedByStack(obj client.Object, stack *envv1alpha1.Stack) bool {
+	if labels := obj.GetLabels(); labels != nil && labels["lissto.dev/stack"] == stack.Name {
+		return true
+	}
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.UID == stack.UID {
+			return true
+		}
+	}
+	return false
 }
 
 // completeDeletion removes the finalizer and emits completion event.
