@@ -11,11 +11,24 @@ import (
 
 // Config holds the operator configuration
 type Config struct {
-	API        APIConfig             `yaml:"api"`
-	Logging    LoggingConfig         `yaml:"logging"`
-	Namespaces NamespacesConfig      `yaml:"namespaces"`
-	Repos      map[string]RepoConfig `yaml:"repos"`
-	Stacks     StacksConfig          `yaml:"stacks"`
+	API           APIConfig             `yaml:"api"`
+	Logging       LoggingConfig         `yaml:"logging"`
+	Namespaces    NamespacesConfig      `yaml:"namespaces"`
+	Repos         map[string]RepoConfig `yaml:"repos"`
+	Stacks        StacksConfig          `yaml:"stacks"`
+	ObjectStorage ObjectStorageConfig   `yaml:"objectStorage,omitempty"`
+}
+
+// ObjectStorageConfig holds object storage configuration for volume snapshots
+// Conventions:
+// - Secret: "lissto-object-storage" in "lissto-system" namespace
+// - Agent image: ghcr.io/lissto-dev/snapshot-agent:v1
+// - Path: {user}/{env}/{repo-hash}/{service}/{mountPath-hash}/{snapshot-id}.tar.gz
+// - Compression: always gzip
+type ObjectStorageConfig struct {
+	// Enabled indicates whether object storage is configured
+	// +optional
+	Enabled bool `yaml:"enabled,omitempty"`
 }
 
 // APIConfig holds API configuration

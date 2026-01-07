@@ -8,6 +8,7 @@ rules:
   - ""
   resources:
   - configmaps
+  - pods
   verbs:
   - get
   - list
@@ -46,12 +47,35 @@ rules:
   - update
   - watch
 - apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - env.lissto.dev
   resources:
   - blueprints
   - envs
   - lifecycles
   - stacks
+  - volumesnapshots
   verbs:
   - create
   - delete
@@ -66,6 +90,7 @@ rules:
   - blueprints/finalizers
   - lifecycles/finalizers
   - stacks/finalizers
+  - volumesnapshots/finalizers
   verbs:
   - update
 - apiGroups:
@@ -75,6 +100,7 @@ rules:
   - envs/status
   - lifecycles/status
   - stacks/status
+  - volumesnapshots/status
   verbs:
   - get
   - patch

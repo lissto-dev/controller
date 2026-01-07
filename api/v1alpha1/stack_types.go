@@ -43,6 +43,14 @@ type ImageInfo struct {
 	ContainerName string `json:"containerName,omitempty"`
 }
 
+// ServiceVolumes specifies volume snapshots to restore for a service
+type ServiceVolumes struct {
+	// SnapshotRefs references VolumeSnapshots to restore
+	// Each snapshot's volumeIdentifier.mountPath determines the target PVC
+	// +required
+	SnapshotRefs []string `json:"snapshotRefs"`
+}
+
 // StackSpec defines the desired state of Stack
 type StackSpec struct {
 	// BlueprintReference references the Blueprint resource
@@ -67,6 +75,11 @@ type StackSpec struct {
 	// This is the only mutable field - updates trigger rolling deployments
 	// +required
 	Images map[string]ImageInfo `json:"images"`
+
+	// Volumes specifies snapshots to restore for each service
+	// The snapshot's volumeIdentifier.mountPath determines which PVC to restore
+	// +optional
+	Volumes map[string]ServiceVolumes `json:"volumes,omitempty"`
 
 	// Metadata contains stack creation metadata
 	// This field is mutable and can be updated to track image sources
