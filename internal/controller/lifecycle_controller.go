@@ -23,7 +23,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -42,14 +41,8 @@ import (
 const (
 	lifecycleFinalizerName = "lifecycle.env.lissto.dev/finalizer"
 
-	// DefaultScaleDownTimeout is the default timeout for scale down operations
-	DefaultScaleDownTimeout = 5 * time.Minute
-
-	// OriginalReplicasAnnotation stores the original replica count before scale down
-	OriginalReplicasAnnotation = "lifecycle.env.lissto.dev/original-replicas"
-
-	// ScaledDownByAnnotation tracks which lifecycle scaled down the deployment
-	ScaledDownByAnnotation = "lifecycle.env.lissto.dev/scaled-down-by"
+	// DefaultStackSuspendTimeout is the default timeout for waiting for stack suspension
+	DefaultStackSuspendTimeout = 5 * time.Minute
 )
 
 // workerHandle holds the cancel function and metadata for a running worker
@@ -429,7 +422,7 @@ func (r *LifecycleReconciler) executeDeleteTask(ctx context.Context, lifecycle *
 	return deleted, evaluated, nil
 }
 
-// executeScaleDownTask scales down all deployments/statefulsets for matching stacks
+// executeScaleDownTask suspends all matching stacks by setting spec.suspended=true
 func (r *LifecycleReconciler) executeScaleDownTask(ctx context.Context, lifecycle *envv1alpha1.Lifecycle, task *envv1alpha1.ScaleDownTask) ([]envv1alpha1.Stack, error) {
 	log := logf.FromContext(ctx).WithValues("lifecycle", lifecycle.Name)
 
@@ -439,7 +432,7 @@ func (r *LifecycleReconciler) executeScaleDownTask(ctx context.Context, lifecycl
 	}
 
 	// Get timeout
-	timeout := DefaultScaleDownTimeout
+	timeout := DefaultStackSuspendTimeout
 	if task.Timeout.Duration > 0 {
 		timeout = task.Timeout.Duration
 	}
@@ -462,111 +455,51 @@ func (r *LifecycleReconciler) executeScaleDownTask(ctx context.Context, lifecycl
 		return nil, fmt.Errorf("failed to list Stacks: %w", err)
 	}
 
-	var scaledStacks []envv1alpha1.Stack
+	var suspendedStacks []envv1alpha1.Stack
 	var errs []error
 
+	// Set suspended=true on all matching stacks
 	for i := range stackList.Items {
 		stack := &stackList.Items[i]
-		log.Info("Scaling down stack", "stack", stack.Name, "namespace", stack.Namespace)
 
-		// Scale down deployments in the stack's namespace
-		if err := r.scaleDownDeployments(ctx, stack.Namespace, lifecycle.Name, timeout); err != nil {
-			errs = append(errs, fmt.Errorf("stack %s/%s: %w", stack.Namespace, stack.Name, err))
+		// Skip if already suspended
+		if stack.Spec.Suspended {
+			log.Info("Stack already suspended", "stack", stack.Name, "namespace", stack.Namespace)
+			suspendedStacks = append(suspendedStacks, *stack)
 			continue
 		}
 
-		// Scale down statefulsets in the stack's namespace
-		if err := r.scaleDownStatefulSets(ctx, stack.Namespace, lifecycle.Name, timeout); err != nil {
-			errs = append(errs, fmt.Errorf("stack %s/%s: %w", stack.Namespace, stack.Name, err))
+		log.Info("Suspending stack", "stack", stack.Name, "namespace", stack.Namespace)
+
+		// Update stack to suspended
+		stack.Spec.Suspended = true
+		if err := r.Update(ctx, stack); err != nil {
+			errs = append(errs, fmt.Errorf("failed to suspend stack %s/%s: %w", stack.Namespace, stack.Name, err))
 			continue
 		}
 
-		scaledStacks = append(scaledStacks, *stack)
+		suspendedStacks = append(suspendedStacks, *stack)
+	}
+
+	// Wait for all stacks to reach Suspended phase
+	if err := r.waitForStacksPhase(ctx, suspendedStacks, envv1alpha1.StackPhaseSuspended, timeout); err != nil {
+		errs = append(errs, err)
 	}
 
 	if len(errs) > 0 {
-		return scaledStacks, fmt.Errorf("failed to scale down %d stack(s): %v", len(errs), errs)
+		return suspendedStacks, fmt.Errorf("failed to suspend %d stack(s): %v", len(errs), errs)
 	}
 
-	return scaledStacks, nil
+	return suspendedStacks, nil
 }
 
-// scaleDownDeployments scales all deployments in a namespace to 0 replicas
-func (r *LifecycleReconciler) scaleDownDeployments(ctx context.Context, namespace, lifecycleName string, timeout time.Duration) error {
+// waitForStacksPhase waits for all stacks to reach the desired phase
+func (r *LifecycleReconciler) waitForStacksPhase(ctx context.Context, stacks []envv1alpha1.Stack, desiredPhase envv1alpha1.StackPhase, timeout time.Duration) error {
 	log := logf.FromContext(ctx)
 
-	var deploymentList appsv1.DeploymentList
-	if err := r.List(ctx, &deploymentList, client.InNamespace(namespace)); err != nil {
-		return fmt.Errorf("failed to list deployments: %w", err)
+	if len(stacks) == 0 {
+		return nil
 	}
-
-	for i := range deploymentList.Items {
-		deploy := &deploymentList.Items[i]
-		if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas == 0 {
-			continue
-		}
-
-		// Store original replicas in annotation
-		if deploy.Annotations == nil {
-			deploy.Annotations = make(map[string]string)
-		}
-		deploy.Annotations[OriginalReplicasAnnotation] = fmt.Sprintf("%d", *deploy.Spec.Replicas)
-		deploy.Annotations[ScaledDownByAnnotation] = lifecycleName
-
-		// Scale to 0
-		zero := int32(0)
-		deploy.Spec.Replicas = &zero
-
-		if err := r.Update(ctx, deploy); err != nil {
-			return fmt.Errorf("failed to scale down deployment %s: %w", deploy.Name, err)
-		}
-
-		log.Info("Scaled down deployment", "deployment", deploy.Name, "namespace", namespace)
-	}
-
-	// Wait for pods to terminate
-	return r.waitForPodsTermination(ctx, namespace, timeout)
-}
-
-// scaleDownStatefulSets scales all statefulsets in a namespace to 0 replicas
-func (r *LifecycleReconciler) scaleDownStatefulSets(ctx context.Context, namespace, lifecycleName string, timeout time.Duration) error {
-	log := logf.FromContext(ctx)
-
-	var stsList appsv1.StatefulSetList
-	if err := r.List(ctx, &stsList, client.InNamespace(namespace)); err != nil {
-		return fmt.Errorf("failed to list statefulsets: %w", err)
-	}
-
-	for i := range stsList.Items {
-		sts := &stsList.Items[i]
-		if sts.Spec.Replicas == nil || *sts.Spec.Replicas == 0 {
-			continue
-		}
-
-		// Store original replicas in annotation
-		if sts.Annotations == nil {
-			sts.Annotations = make(map[string]string)
-		}
-		sts.Annotations[OriginalReplicasAnnotation] = fmt.Sprintf("%d", *sts.Spec.Replicas)
-		sts.Annotations[ScaledDownByAnnotation] = lifecycleName
-
-		// Scale to 0
-		zero := int32(0)
-		sts.Spec.Replicas = &zero
-
-		if err := r.Update(ctx, sts); err != nil {
-			return fmt.Errorf("failed to scale down statefulset %s: %w", sts.Name, err)
-		}
-
-		log.Info("Scaled down statefulset", "statefulset", sts.Name, "namespace", namespace)
-	}
-
-	return nil
-}
-
-// waitForPodsTermination waits for all pods in a namespace to terminate
-func (r *LifecycleReconciler) waitForPodsTermination(ctx context.Context, namespace string, timeout time.Duration) error {
-	log := logf.FromContext(ctx)
 
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(2 * time.Second)
@@ -578,27 +511,32 @@ func (r *LifecycleReconciler) waitForPodsTermination(ctx context.Context, namesp
 			return ctx.Err()
 		case <-ticker.C:
 			if time.Now().After(deadline) {
-				return fmt.Errorf("timeout waiting for pods to terminate in namespace %s", namespace)
+				return fmt.Errorf("timeout waiting for stacks to reach phase %s", desiredPhase)
 			}
 
-			var podList corev1.PodList
-			if err := r.List(ctx, &podList, client.InNamespace(namespace)); err != nil {
-				return fmt.Errorf("failed to list pods: %w", err)
-			}
+			allReady := true
+			for _, stack := range stacks {
+				// Fetch current stack state
+				var currentStack envv1alpha1.Stack
+				if err := r.Get(ctx, client.ObjectKey{Name: stack.Name, Namespace: stack.Namespace}, &currentStack); err != nil {
+					log.Error(err, "Failed to get stack status", "stack", stack.Name)
+					allReady = false
+					continue
+				}
 
-			runningPods := 0
-			for _, pod := range podList.Items {
-				if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
-					runningPods++
+				if currentStack.Status.Phase != desiredPhase {
+					log.Info("Waiting for stack phase",
+						"stack", stack.Name,
+						"currentPhase", currentStack.Status.Phase,
+						"desiredPhase", desiredPhase)
+					allReady = false
 				}
 			}
 
-			if runningPods == 0 {
-				log.Info("All pods terminated", "namespace", namespace)
+			if allReady {
+				log.Info("All stacks reached desired phase", "phase", desiredPhase, "count", len(stacks))
 				return nil
 			}
-
-			log.Info("Waiting for pods to terminate", "namespace", namespace, "runningPods", runningPods)
 		}
 	}
 }
@@ -737,114 +675,47 @@ func (r *LifecycleReconciler) executeSnapshotTask(ctx context.Context, lifecycle
 	return snapshotsCreated, nil
 }
 
-// executeScaleUpTask restores deployments/statefulsets to their original replica counts
+// executeScaleUpTask resumes all stacks by setting spec.suspended=false
 func (r *LifecycleReconciler) executeScaleUpTask(ctx context.Context, lifecycle *envv1alpha1.Lifecycle, stacks []envv1alpha1.Stack) error {
 	log := logf.FromContext(ctx).WithValues("lifecycle", lifecycle.Name)
 
 	var errs []error
 
+	// Set suspended=false on all stacks
 	for _, stack := range stacks {
-		// Scale up deployments
-		if err := r.scaleUpDeployments(ctx, stack.Namespace, lifecycle.Name); err != nil {
-			errs = append(errs, fmt.Errorf("stack %s/%s deployments: %w", stack.Namespace, stack.Name, err))
+		// Fetch current stack state
+		var currentStack envv1alpha1.Stack
+		if err := r.Get(ctx, client.ObjectKey{Name: stack.Name, Namespace: stack.Namespace}, &currentStack); err != nil {
+			errs = append(errs, fmt.Errorf("failed to get stack %s/%s: %w", stack.Namespace, stack.Name, err))
+			continue
 		}
 
-		// Scale up statefulsets
-		if err := r.scaleUpStatefulSets(ctx, stack.Namespace, lifecycle.Name); err != nil {
-			errs = append(errs, fmt.Errorf("stack %s/%s statefulsets: %w", stack.Namespace, stack.Name, err))
+		// Skip if already running
+		if !currentStack.Spec.Suspended {
+			log.Info("Stack already running", "stack", stack.Name, "namespace", stack.Namespace)
+			continue
 		}
 
-		log.Info("Scaled up stack", "stack", stack.Name, "namespace", stack.Namespace)
+		log.Info("Resuming stack", "stack", stack.Name, "namespace", stack.Namespace)
+
+		// Update stack to not suspended
+		currentStack.Spec.Suspended = false
+		if err := r.Update(ctx, &currentStack); err != nil {
+			errs = append(errs, fmt.Errorf("failed to resume stack %s/%s: %w", stack.Namespace, stack.Name, err))
+			continue
+		}
+	}
+
+	// Wait for all stacks to reach Running phase
+	if err := r.waitForStacksPhase(ctx, stacks, envv1alpha1.StackPhaseRunning, DefaultStackSuspendTimeout); err != nil {
+		errs = append(errs, err)
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("failed to scale up some stacks: %v", errs)
+		return fmt.Errorf("failed to resume some stacks: %v", errs)
 	}
 
-	return nil
-}
-
-// scaleUpDeployments restores deployments to their original replica counts
-func (r *LifecycleReconciler) scaleUpDeployments(ctx context.Context, namespace, lifecycleName string) error {
-	log := logf.FromContext(ctx)
-
-	var deploymentList appsv1.DeploymentList
-	if err := r.List(ctx, &deploymentList, client.InNamespace(namespace)); err != nil {
-		return fmt.Errorf("failed to list deployments: %w", err)
-	}
-
-	for i := range deploymentList.Items {
-		deploy := &deploymentList.Items[i]
-
-		// Only restore if we scaled it down
-		if deploy.Annotations[ScaledDownByAnnotation] != lifecycleName {
-			continue
-		}
-
-		originalReplicasStr := deploy.Annotations[OriginalReplicasAnnotation]
-		if originalReplicasStr == "" {
-			continue
-		}
-
-		var originalReplicas int32
-		if _, err := fmt.Sscanf(originalReplicasStr, "%d", &originalReplicas); err != nil {
-			log.Error(err, "Failed to parse original replicas", "deployment", deploy.Name)
-			continue
-		}
-
-		deploy.Spec.Replicas = &originalReplicas
-		delete(deploy.Annotations, OriginalReplicasAnnotation)
-		delete(deploy.Annotations, ScaledDownByAnnotation)
-
-		if err := r.Update(ctx, deploy); err != nil {
-			return fmt.Errorf("failed to scale up deployment %s: %w", deploy.Name, err)
-		}
-
-		log.Info("Scaled up deployment", "deployment", deploy.Name, "replicas", originalReplicas)
-	}
-
-	return nil
-}
-
-// scaleUpStatefulSets restores statefulsets to their original replica counts
-func (r *LifecycleReconciler) scaleUpStatefulSets(ctx context.Context, namespace, lifecycleName string) error {
-	log := logf.FromContext(ctx)
-
-	var stsList appsv1.StatefulSetList
-	if err := r.List(ctx, &stsList, client.InNamespace(namespace)); err != nil {
-		return fmt.Errorf("failed to list statefulsets: %w", err)
-	}
-
-	for i := range stsList.Items {
-		sts := &stsList.Items[i]
-
-		// Only restore if we scaled it down
-		if sts.Annotations[ScaledDownByAnnotation] != lifecycleName {
-			continue
-		}
-
-		originalReplicasStr := sts.Annotations[OriginalReplicasAnnotation]
-		if originalReplicasStr == "" {
-			continue
-		}
-
-		var originalReplicas int32
-		if _, err := fmt.Sscanf(originalReplicasStr, "%d", &originalReplicas); err != nil {
-			log.Error(err, "Failed to parse original replicas", "statefulset", sts.Name)
-			continue
-		}
-
-		sts.Spec.Replicas = &originalReplicas
-		delete(sts.Annotations, OriginalReplicasAnnotation)
-		delete(sts.Annotations, ScaledDownByAnnotation)
-
-		if err := r.Update(ctx, sts); err != nil {
-			return fmt.Errorf("failed to scale up statefulset %s: %w", sts.Name, err)
-		}
-
-		log.Info("Scaled up statefulset", "statefulset", sts.Name, "replicas", originalReplicas)
-	}
-
+	log.Info("All stacks resumed", "count", len(stacks))
 	return nil
 }
 

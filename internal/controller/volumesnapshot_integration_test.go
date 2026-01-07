@@ -137,7 +137,7 @@ var _ = Describe("VolumeSnapshot Integration", func() {
 
 		reconciler := &VolumeSnapshotReconciler{
 			Client: k8sClient, Scheme: k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(10), Config: testConfig(),
+			Recorder: record.NewFakeRecorder(10),
 		}
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: vs.Name, Namespace: ns.Name},

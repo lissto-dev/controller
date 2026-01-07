@@ -7,6 +7,10 @@ It bridges the gap between Compose loved by developers and Kubernetes loved by D
 
 The Kubernetes controller component of the Lissto platform. Manages Blueprint, Env, and Stack custom resources.
 
+## Requirements
+
+- **Kubernetes 1.28+** (required for ValidatingAdmissionPolicy)
+
 ## Quick Start
 
 Build:

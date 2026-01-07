@@ -71,10 +71,6 @@ type StackReconciler struct {
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Stack object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.1/pkg/reconcile
@@ -87,7 +83,8 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("Reconciling Stack", "name", stack.Name, "namespace", stack.Namespace)
+	log.Info("Reconciling Stack", "name", stack.Name, "namespace", stack.Namespace,
+		"suspended", stack.Spec.Suspended, "phase", stack.Status.Phase)
 
 	// Handle finalizer for cleanup
 	if stack.DeletionTimestamp.IsZero() {
@@ -145,6 +142,15 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	log.Info("Parsed manifests", "count", len(objects))
+
+	// Validate all resources have the required lissto.dev/class annotation
+	if err := validateResourceAnnotations(objects); err != nil {
+		log.Error(err, "Resource validation failed")
+		r.Recorder.Eventf(stack, corev1.EventTypeWarning, "ValidationFailed",
+			"Resource validation failed: %v", err)
+		r.updateStackStatus(ctx, stack, nil, nil, nil, err)
+		return ctrl.Result{}, err
+	}
 
 	// Fetch blueprint for config discovery
 	blueprint, err := r.getBlueprint(ctx, stack)
@@ -206,22 +212,27 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// Inject images from Stack spec into deployments
 	imageWarnings := r.injectImages(ctx, objects, stack.Spec.Images)
 
-	// Separate PVCs from other resources for restore flow
-	var pvcObjects, otherObjects []*unstructured.Unstructured
-	for _, obj := range objects {
+	// Categorize resources based on suspension state
+	stateResources, workloadsToApply, workloadsToDelete := r.categorizeResources(stack, objects)
+
+	log.Info("Resource categorization",
+		"stateResources", len(stateResources),
+		"workloadsToApply", len(workloadsToApply),
+		"workloadsToDelete", len(workloadsToDelete))
+
+	// Always apply state resources first (PVCs, etc.)
+	stateResults := r.applyResources(ctx, stateResources, stack.Namespace)
+	r.setOwnerReferences(ctx, stack, stateResources, stateResults)
+
+	// Handle volume restore if needed (only for state resources that are PVCs)
+	var pvcObjects []*unstructured.Unstructured
+	for _, obj := range stateResources {
 		if obj.GetKind() == "PersistentVolumeClaim" {
 			pvcObjects = append(pvcObjects, obj)
-		} else {
-			otherObjects = append(otherObjects, obj)
 		}
 	}
 
-	// Apply PVCs first
-	pvcResults := r.applyResources(ctx, pvcObjects, stack.Namespace)
-	r.setOwnerReferences(ctx, stack, pvcObjects, pvcResults)
-
-	// Handle volume restore if needed
-	if r.needsVolumeRestore(stack) {
+	if r.needsVolumeRestore(stack) && len(pvcObjects) > 0 {
 		restoreComplete, restoreResults, err := r.restoreVolumes(ctx, stack, pvcObjects)
 		if err != nil {
 			log.Error(err, "Failed to restore volumes")
@@ -247,17 +258,72 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		log.Info("Volume restore complete", "results", len(restoreResults))
 	}
 
-	// Apply other resources (deployments, services, etc.)
-	otherResults := r.applyResources(ctx, otherObjects, stack.Namespace)
-	r.setOwnerReferences(ctx, stack, otherObjects, otherResults)
+	// Delete workloads that should be suspended
+	for _, obj := range workloadsToDelete {
+		if err := r.deleteWorkloadResource(ctx, obj, stack.Namespace); err != nil {
+			log.Error(err, "Failed to delete workload resource",
+				"kind", obj.GetKind(), "name", obj.GetName())
+		}
+	}
+
+	// Apply workloads that should be running
+	workloadResults := r.applyResources(ctx, workloadsToApply, stack.Namespace)
+	r.setOwnerReferences(ctx, stack, workloadsToApply, workloadResults)
+
+	// Check if all suspended workloads have terminated
+	allWorkloadsTerminated := true
+	if len(workloadsToDelete) > 0 {
+		terminated, err := r.waitForWorkloadsTermination(ctx, stack)
+		if err != nil {
+			log.Error(err, "Error checking workload termination")
+		}
+		allWorkloadsTerminated = terminated
+	}
+
+	// Determine and update phase
+	newPhase := r.determineStackPhase(stack, allWorkloadsTerminated)
+	oldPhase := stack.Status.Phase
+
+	if oldPhase != newPhase {
+		var reason, message string
+		switch newPhase {
+		case envv1alpha1.StackPhaseSuspending:
+			reason = "Suspending"
+			message = fmt.Sprintf("Suspending stack, deleting %d workload resources", len(workloadsToDelete))
+		case envv1alpha1.StackPhaseSuspended:
+			reason = "Suspended"
+			message = fmt.Sprintf("Stack suspended, %d state resources preserved", len(stateResources))
+		case envv1alpha1.StackPhaseResuming:
+			reason = "Resuming"
+			message = fmt.Sprintf("Resuming stack, recreating %d workload resources", len(workloadsToApply))
+		case envv1alpha1.StackPhaseRunning:
+			if oldPhase == "" {
+				reason = "StackCreated"
+				message = "Stack created and all resources applied"
+			} else {
+				reason = "Running"
+				message = fmt.Sprintf("Stack running, %d resources applied", len(stateResources)+len(workloadsToApply))
+			}
+		}
+		r.transitionPhase(ctx, stack, newPhase, reason, message)
+	}
+
+	// Update per-service statuses
+	r.updateServiceStatuses(ctx, stack, objects)
 
 	// Combine results for status update
-	results := append(pvcResults, otherResults...)
+	results := append(stateResults, workloadResults...)
 
 	// Update Stack status with results
 	r.updateStackStatus(ctx, stack, results, imageWarnings, configResult, nil)
 
-	log.Info("Stack reconciliation complete", "name", stack.Name)
+	// If we're still suspending, requeue to check termination
+	if stack.Status.Phase == envv1alpha1.StackPhaseSuspending {
+		log.Info("Stack suspending, requeuing to check termination")
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	log.Info("Stack reconciliation complete", "name", stack.Name, "phase", stack.Status.Phase)
 	return ctrl.Result{}, nil
 }
 

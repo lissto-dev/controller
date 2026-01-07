@@ -5,5 +5,43 @@ metadata:
     app.kubernetes.io/name: operator
     app.kubernetes.io/managed-by: kustomize
   name: stack-sample
+  namespace: dev-user
 spec:
-  # TODO(user): Add fields here
+  blueprintReference: my-blueprint
+  manifestsConfigMapRef: my-manifests
+  env: dev
+  images:
+    web:
+      digest: "sha256:abc123..."
+      image: "myapp:v1.0.0"
+    postgres:
+      digest: "sha256:def456..."
+      image: "postgres:15"
+  
+  # Suspension settings (optional)
+  # suspended: false           # Set to true to suspend all workloads
+  # suspendedServices: []      # List specific services to suspend
+  # suspendTimeout: 5m         # Timeout for workload termination
+---
+# Example: Stack with per-service suspension
+apiVersion: env.lissto.dev/v1alpha1
+kind: Stack
+metadata:
+  name: stack-with-suspended-worker
+  namespace: dev-user
+spec:
+  blueprintReference: my-blueprint
+  manifestsConfigMapRef: my-manifests
+  env: dev
+  images:
+    web:
+      digest: "sha256:abc123..."
+    worker:
+      digest: "sha256:ghi789..."
+    postgres:
+      digest: "sha256:def456..."
+  
+  # Suspend only the worker service (web and postgres keep running)
+  suspended: false
+  suspendedServices:
+    - worker
