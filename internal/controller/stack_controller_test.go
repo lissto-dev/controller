@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -166,10 +167,16 @@ var _ = Describe("Stack Controller", func() {
 		AfterEach(func() {
 			By("Cleanup test resources")
 
-			// Delete Stack if it exists
+			// Clean up any orphan resources first
+			cleanupOrphanResources(ctx, namespace, stackName)
+
+			// Delete Stack if it exists (remove finalizer first if needed)
 			stack := &envv1alpha1.Stack{}
 			err := k8sClient.Get(ctx, typeNamespacedName, stack)
 			if err == nil {
+				// Remove finalizer to allow deletion
+				stack.Finalizers = nil
+				_ = k8sClient.Update(ctx, stack)
 				_ = k8sClient.Delete(ctx, stack)
 			}
 
@@ -180,15 +187,14 @@ var _ = Describe("Stack Controller", func() {
 				_ = k8sClient.Delete(ctx, cm)
 			}
 
-			// Delete Blueprint
+			// Delete Blueprint (remove finalizer first if needed)
 			bp := &envv1alpha1.Blueprint{}
 			err = k8sClient.Get(ctx, types.NamespacedName{Name: "cleanup-test-blueprint", Namespace: namespace}, bp)
 			if err == nil {
+				bp.Finalizers = nil
+				_ = k8sClient.Update(ctx, bp)
 				_ = k8sClient.Delete(ctx, bp)
 			}
-
-			// Clean up any orphan resources that might be left
-			cleanupOrphanResources(ctx, namespace, stackName)
 		})
 
 		It("should cleanup orphan secrets with lissto.dev/stack label", func() {
@@ -226,9 +232,17 @@ var _ = Describe("Stack Controller", func() {
 			By("Deleting the Stack")
 			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
 
-			By("Reconciling to trigger cleanup")
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
+			By("Reconciling to trigger cleanup and complete deletion")
+			// With deletion protection, we may need multiple reconciles
+			Eventually(func() bool {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				if err != nil {
+					return false
+				}
+				// Check if stack is gone (finalizer removed)
+				err = k8sClient.Get(ctx, typeNamespacedName, stack)
+				return errors.IsNotFound(err)
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "Stack should be deleted")
 
 			By("Verifying the orphan secret was cleaned up")
 			Eventually(func() bool {
@@ -276,9 +290,15 @@ var _ = Describe("Stack Controller", func() {
 			By("Deleting the Stack")
 			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
 
-			By("Reconciling to trigger cleanup")
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
+			By("Reconciling to trigger cleanup and complete deletion")
+			Eventually(func() bool {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				if err != nil {
+					return false
+				}
+				err = k8sClient.Get(ctx, typeNamespacedName, stack)
+				return errors.IsNotFound(err)
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "Stack should be deleted")
 
 			By("Verifying the orphan service was cleaned up")
 			Eventually(func() bool {
@@ -352,9 +372,15 @@ var _ = Describe("Stack Controller", func() {
 			By("Deleting the Stack")
 			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
 
-			By("Reconciling to trigger cleanup")
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
+			By("Reconciling to trigger cleanup and complete deletion")
+			Eventually(func() bool {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				if err != nil {
+					return false
+				}
+				err = k8sClient.Get(ctx, typeNamespacedName, stack)
+				return errors.IsNotFound(err)
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "Stack should be deleted")
 
 			By("Verifying orphan secret and service were cleaned up")
 			// Note: ConfigMap is not in the cleanup list, so it won't be deleted
@@ -394,9 +420,15 @@ var _ = Describe("Stack Controller", func() {
 			By("Deleting the Stack")
 			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
 
-			By("Reconciling to trigger cleanup")
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
+			By("Reconciling to trigger cleanup and complete deletion")
+			Eventually(func() bool {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				if err != nil {
+					return false
+				}
+				err = k8sClient.Get(ctx, typeNamespacedName, stack)
+				return errors.IsNotFound(err)
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "Stack should be deleted")
 
 			By("Verifying the other stack's secret was NOT deleted")
 			Consistently(func() error {
@@ -443,9 +475,15 @@ var _ = Describe("Stack Controller", func() {
 			By("Deleting the Stack")
 			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
 
-			By("Reconciling to trigger cleanup")
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
+			By("Reconciling to trigger cleanup and complete deletion")
+			Eventually(func() bool {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				if err != nil {
+					return false
+				}
+				err = k8sClient.Get(ctx, typeNamespacedName, stack)
+				return errors.IsNotFound(err)
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "Stack should be deleted")
 
 			By("Verifying the owned secret was cleaned up")
 			Eventually(func() bool {
@@ -455,6 +493,342 @@ var _ = Describe("Stack Controller", func() {
 		})
 	})
 })
+
+var _ = Describe("Stack Deletion Protection", func() {
+	Context("calculateDeletionBackoff", func() {
+		It("should return base backoff for retry count 0", func() {
+			backoff := calculateDeletionBackoff(0)
+			Expect(backoff).To(Equal(5 * time.Second))
+		})
+
+		It("should double backoff for each retry", func() {
+			Expect(calculateDeletionBackoff(0)).To(Equal(5 * time.Second))
+			Expect(calculateDeletionBackoff(1)).To(Equal(10 * time.Second))
+			Expect(calculateDeletionBackoff(2)).To(Equal(20 * time.Second))
+			Expect(calculateDeletionBackoff(3)).To(Equal(40 * time.Second))
+			Expect(calculateDeletionBackoff(4)).To(Equal(80 * time.Second))
+			Expect(calculateDeletionBackoff(5)).To(Equal(160 * time.Second))
+		})
+
+		It("should cap backoff at 5 minutes", func() {
+			Expect(calculateDeletionBackoff(6)).To(Equal(5 * time.Minute))
+			Expect(calculateDeletionBackoff(7)).To(Equal(5 * time.Minute))
+			Expect(calculateDeletionBackoff(10)).To(Equal(5 * time.Minute))
+			Expect(calculateDeletionBackoff(100)).To(Equal(5 * time.Minute))
+		})
+	})
+
+	Context("formatResourceList", func() {
+		It("should return empty string for empty list", func() {
+			Expect(formatResourceList([]string{})).To(Equal(""))
+		})
+
+		It("should format single resource", func() {
+			Expect(formatResourceList([]string{"Deployment/web"})).To(Equal("Deployment/web"))
+		})
+
+		It("should format multiple resources with comma separation", func() {
+			resources := []string{"Deployment/web", "Service/web", "PVC/data"}
+			Expect(formatResourceList(resources)).To(Equal("Deployment/web, Service/web, PVC/data"))
+		})
+
+		It("should truncate list with more than 5 resources", func() {
+			resources := []string{
+				"Deployment/web",
+				"Service/web",
+				"PVC/data",
+				"Secret/config",
+				"Ingress/web",
+				"Pod/web-abc123",
+				"Pod/web-def456",
+			}
+			result := formatResourceList(resources)
+			Expect(result).To(ContainSubstring("Deployment/web"))
+			Expect(result).To(ContainSubstring("... and 2 more"))
+		})
+	})
+
+	Context("When deleting a Stack with child resources", func() {
+		const stackName = "deletion-protection-test"
+		const namespace = "default"
+
+		ctx := context.Background()
+
+		typeNamespacedName := types.NamespacedName{
+			Name:      stackName,
+			Namespace: namespace,
+		}
+
+		var controllerReconciler *StackReconciler
+
+		BeforeEach(func() {
+			controllerReconciler = &StackReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: &fakeRecorder{},
+				Config: &config.Config{
+					Namespaces: config.NamespacesConfig{
+						Global: "lissto-global",
+					},
+				},
+			}
+
+			By("creating the required Blueprint")
+			blueprint := testdata.NewBlueprint(namespace, "deletion-test-blueprint")
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: "deletion-test-blueprint", Namespace: namespace}, &envv1alpha1.Blueprint{})
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, blueprint)).To(Succeed())
+			}
+
+			By("creating the required ConfigMap")
+			configMap := testdata.NewManifestsConfigMap(namespace, "deletion-test-manifests")
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "deletion-test-manifests", Namespace: namespace}, &corev1.ConfigMap{})
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
+			}
+		})
+
+		AfterEach(func() {
+			By("Cleanup test resources")
+
+			// Delete Stack if it exists (remove finalizer first if needed)
+			stack := &envv1alpha1.Stack{}
+			err := k8sClient.Get(ctx, typeNamespacedName, stack)
+			if err == nil {
+				// Remove finalizer to allow deletion
+				stack.Finalizers = nil
+				_ = k8sClient.Update(ctx, stack)
+				_ = k8sClient.Delete(ctx, stack)
+			}
+
+			// Delete ConfigMap
+			cm := &corev1.ConfigMap{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "deletion-test-manifests", Namespace: namespace}, cm)
+			if err == nil {
+				_ = k8sClient.Delete(ctx, cm)
+			}
+
+			// Delete Blueprint (remove finalizer first if needed)
+			bp := &envv1alpha1.Blueprint{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "deletion-test-blueprint", Namespace: namespace}, bp)
+			if err == nil {
+				bp.Finalizers = nil
+				_ = k8sClient.Update(ctx, bp)
+				_ = k8sClient.Delete(ctx, bp)
+			}
+
+			// Clean up any orphan resources
+			cleanupOrphanResources(ctx, namespace, stackName)
+		})
+
+		It("should wait for child resources before removing finalizer", func() {
+			By("Creating a Stack and reconciling it")
+			stack := testdata.NewStack(namespace, stackName, "default/deletion-test-blueprint", "deletion-test-manifests")
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Reconcile to add finalizer
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Get the stack to have its UID
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
+			Expect(stack.Finalizers).To(ContainElement(stackFinalizerName))
+
+			By("Creating a child Pod with a finalizer (to prevent immediate deletion)")
+			childPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       stackName + "-child-pod",
+					Namespace:  namespace,
+					Finalizers: []string{"test.lissto.dev/block-deletion"},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "env.lissto.dev/v1alpha1",
+							Kind:       "Stack",
+							Name:       stack.Name,
+							UID:        stack.UID,
+						},
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "test", Image: "busybox"},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, childPod)).To(Succeed())
+
+			By("Deleting the Stack")
+			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
+
+			By("Reconciling - should requeue because child resource exists (has finalizer)")
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0), "Should requeue with backoff")
+
+			By("Verifying Stack still has finalizer")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
+			Expect(stack.Finalizers).To(ContainElement(stackFinalizerName))
+
+			By("Verifying Deleting condition is set")
+			deletingCondition := findCondition(stack.Status.Conditions, envv1alpha1.StackConditionTypeDeleting)
+			Expect(deletingCondition).NotTo(BeNil())
+			Expect(deletingCondition.Status).To(Equal(metav1.ConditionTrue))
+			Expect(deletingCondition.Reason).To(Equal(envv1alpha1.StackReasonWaitingForChildren))
+
+			By("Removing the finalizer from the child Pod to allow deletion")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: childPod.Name, Namespace: namespace}, childPod)).To(Succeed())
+			childPod.Finalizers = nil
+			Expect(k8sClient.Update(ctx, childPod)).To(Succeed())
+
+			By("Reconciling again - should complete deletion")
+			Eventually(func() bool {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				if err != nil {
+					return false
+				}
+				// Check if stack is gone
+				err = k8sClient.Get(ctx, typeNamespacedName, stack)
+				return errors.IsNotFound(err)
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "Stack should be deleted after child resources are gone")
+		})
+
+		It("should update retry count annotation on each reconcile", func() {
+			By("Creating a Stack and reconciling it")
+			stack := testdata.NewStack(namespace, stackName, "default/deletion-test-blueprint", "deletion-test-manifests")
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Reconcile to add finalizer
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Get the stack to have its UID
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
+
+			By("Creating a child Pod with a finalizer (to prevent immediate deletion)")
+			childPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       stackName + "-retry-test-pod",
+					Namespace:  namespace,
+					Finalizers: []string{"test.lissto.dev/block-deletion"},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "env.lissto.dev/v1alpha1",
+							Kind:       "Stack",
+							Name:       stack.Name,
+							UID:        stack.UID,
+						},
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "test", Image: "busybox"},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, childPod)).To(Succeed())
+
+			By("Deleting the Stack")
+			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
+
+			By("First reconcile - retry count should be 1")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
+			Expect(stack.Annotations[deletionRetryCountAnnotation]).To(Equal("1"))
+
+			By("Second reconcile - retry count should be 2")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
+			Expect(stack.Annotations[deletionRetryCountAnnotation]).To(Equal("2"))
+
+			// Cleanup - remove finalizer from pod
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: childPod.Name, Namespace: namespace}, childPod)).To(Succeed())
+			childPod.Finalizers = nil
+			_ = k8sClient.Update(ctx, childPod)
+		})
+
+		It("should increase backoff exponentially", func() {
+			By("Creating a Stack and reconciling it")
+			stack := testdata.NewStack(namespace, stackName, "default/deletion-test-blueprint", "deletion-test-manifests")
+			Expect(k8sClient.Create(ctx, stack)).To(Succeed())
+
+			// Reconcile to add finalizer
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Get the stack to have its UID
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stack)).To(Succeed())
+
+			By("Creating a child Pod with a finalizer (to prevent immediate deletion)")
+			childPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       stackName + "-backoff-test-pod",
+					Namespace:  namespace,
+					Finalizers: []string{"test.lissto.dev/block-deletion"},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "env.lissto.dev/v1alpha1",
+							Kind:       "Stack",
+							Name:       stack.Name,
+							UID:        stack.UID,
+						},
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "test", Image: "busybox"},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, childPod)).To(Succeed())
+
+			By("Deleting the Stack")
+			Expect(k8sClient.Delete(ctx, stack)).To(Succeed())
+
+			By("First reconcile - backoff should be 5s")
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(5 * time.Second))
+
+			By("Second reconcile - backoff should be 10s")
+			result, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+
+			By("Third reconcile - backoff should be 20s")
+			result, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(20 * time.Second))
+
+			// Cleanup - remove finalizer from pod
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: childPod.Name, Namespace: namespace}, childPod)).To(Succeed())
+			childPod.Finalizers = nil
+			_ = k8sClient.Update(ctx, childPod)
+		})
+	})
+})
+
+// fakeRecorder is a simple fake event recorder for testing
+type fakeRecorder struct{}
+
+func (f *fakeRecorder) Event(object runtime.Object, eventtype, reason, message string) {}
+func (f *fakeRecorder) Eventf(object runtime.Object, eventtype, reason, messageFmt string, args ...interface{}) {
+}
+func (f *fakeRecorder) AnnotatedEventf(object runtime.Object, annotations map[string]string, eventtype, reason, messageFmt string, args ...interface{}) {
+}
+
+// findCondition finds a condition by type in a slice of conditions
+func findCondition(conditions []metav1.Condition, conditionType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == conditionType {
+			return &conditions[i]
+		}
+	}
+	return nil
+}
 
 // Helper function to cleanup orphan resources after tests
 func cleanupOrphanResources(ctx context.Context, namespace, stackName string) {

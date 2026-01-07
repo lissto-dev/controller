@@ -19,7 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -40,7 +42,19 @@ import (
 	"github.com/lissto-dev/controller/pkg/config"
 )
 
-const stackFinalizerName = "stack.lissto.dev/config-cleanup"
+const (
+	stackFinalizerName = "stack.lissto.dev/config-cleanup"
+
+	// Annotation to track deletion retry count for exponential backoff
+	deletionRetryCountAnnotation = "lissto.dev/deletion-retry-count"
+
+	// Deletion timeout after which we mark as failed (but continue retrying)
+	deletionTimeout = 5 * time.Minute
+
+	// Exponential backoff parameters (matching K8s pod restart backoff)
+	deletionBackoffBase = 5 * time.Second
+	deletionBackoffMax  = 5 * time.Minute
+)
 
 // StackReconciler reconciles a Stack object
 type StackReconciler struct {
@@ -96,22 +110,9 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			log.Info("Added finalizer to Stack")
 		}
 	} else {
-		// Stack is being deleted, run cleanup
+		// Stack is being deleted, run cleanup with deletion protection
 		if controllerutil.ContainsFinalizer(stack, stackFinalizerName) {
-			// Run comprehensive cleanup as safety net
-			// Owner references should handle most cleanup, but this ensures everything is gone
-			if err := r.cleanupStackResources(ctx, stack); err != nil {
-				log.Error(err, "Failed to cleanup stack resources")
-				return ctrl.Result{}, err
-			}
-
-			// Remove finalizer
-			controllerutil.RemoveFinalizer(stack, stackFinalizerName)
-			if err := r.Update(ctx, stack); err != nil {
-				log.Error(err, "Failed to remove finalizer")
-				return ctrl.Result{}, err
-			}
-			log.Info("Removed finalizer from Stack")
+			return r.handleStackDeletion(ctx, stack)
 		}
 		// Stop reconciliation as the Stack is being deleted
 		return ctrl.Result{}, nil
@@ -779,6 +780,287 @@ func (r *StackReconciler) cleanupStackResources(ctx context.Context, stack *envv
 	}
 
 	return nil
+}
+
+// handleStackDeletion manages the Stack deletion process with protection.
+// It waits for all child resources to be deleted before removing the finalizer.
+func (r *StackReconciler) handleStackDeletion(ctx context.Context, stack *envv1alpha1.Stack) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	// Issue delete calls for owned resources (idempotent)
+	if err := r.cleanupStackResources(ctx, stack); err != nil {
+		log.Error(err, "Failed to cleanup stack resources")
+		return ctrl.Result{}, err
+	}
+
+	// Count remaining owned resources
+	remainingResources, err := r.countOwnedResources(ctx, stack)
+	if err != nil {
+		log.Error(err, "Failed to count owned resources")
+		return ctrl.Result{}, err
+	}
+
+	// If no resources remain, deletion is complete
+	if len(remainingResources) == 0 {
+		return r.completeDeletion(ctx, stack)
+	}
+
+	// Resources still exist - calculate timing and update status
+	elapsed := time.Since(stack.DeletionTimestamp.Time)
+	timedOut := elapsed >= deletionTimeout
+
+	// Get and increment retry count for backoff calculation
+	retryCount := r.getDeletionRetryCount(stack)
+	backoff := calculateDeletionBackoff(retryCount)
+
+	// Format remaining resources for status message
+	resourceList := formatResourceList(remainingResources)
+
+	if timedOut {
+		// Deletion timed out - mark as failed but continue retrying
+		return r.handleDeletionTimeout(ctx, stack, resourceList, backoff, retryCount)
+	}
+
+	// Still within timeout - update status and requeue
+	return r.handleDeletionInProgress(ctx, stack, resourceList, backoff, retryCount, len(remainingResources))
+}
+
+// countOwnedResources returns a list of resources still owned by the Stack.
+// Returns slice of "Kind/Name" strings for status messages.
+func (r *StackReconciler) countOwnedResources(ctx context.Context, stack *envv1alpha1.Stack) ([]string, error) {
+	log := logf.FromContext(ctx)
+	var remaining []string
+
+	resourceTypes := []struct {
+		kind string
+		list client.ObjectList
+	}{
+		{"Deployment", &appsv1.DeploymentList{}},
+		{"Service", &corev1.ServiceList{}},
+		{"Ingress", &networkingv1.IngressList{}},
+		{"PersistentVolumeClaim", &corev1.PersistentVolumeClaimList{}},
+		{"Secret", &corev1.SecretList{}},
+		{"Pod", &corev1.PodList{}},
+	}
+
+	for _, rt := range resourceTypes {
+		if err := r.List(ctx, rt.list, client.InNamespace(stack.Namespace)); err != nil {
+			log.Error(err, "Failed to list resources", "kind", rt.kind)
+			return nil, err
+		}
+
+		items, err := meta.ExtractList(rt.list)
+		if err != nil {
+			log.Error(err, "Failed to extract list items", "kind", rt.kind)
+			return nil, err
+		}
+
+		for _, item := range items {
+			obj, ok := item.(client.Object)
+			if !ok {
+				continue
+			}
+
+			if r.isOwnedByStack(obj, stack) {
+				remaining = append(remaining, fmt.Sprintf("%s/%s", rt.kind, obj.GetName()))
+			}
+		}
+	}
+
+	return remaining, nil
+}
+
+// isOwnedByStack checks if a resource is owned by the given Stack.
+func (r *StackReconciler) isOwnedByStack(obj client.Object, stack *envv1alpha1.Stack) bool {
+	// Check owner references
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.UID == stack.UID {
+			return true
+		}
+	}
+
+	// Also check for managed-by label (for secrets)
+	labels := obj.GetLabels()
+	if labels != nil && labels["lissto.dev/stack"] == stack.Name {
+		return true
+	}
+
+	return false
+}
+
+// completeDeletion removes the finalizer and emits completion event.
+func (r *StackReconciler) completeDeletion(ctx context.Context, stack *envv1alpha1.Stack) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	// Emit completion event
+	if r.Recorder != nil {
+		r.Recorder.Event(stack, corev1.EventTypeNormal, "DeletionComplete",
+			"All child resources have been deleted")
+	}
+
+	// Update status to show deletion complete
+	meta.SetStatusCondition(&stack.Status.Conditions, metav1.Condition{
+		Type:               envv1alpha1.StackConditionTypeDeleting,
+		Status:             metav1.ConditionFalse,
+		Reason:             envv1alpha1.StackReasonDeletionComplete,
+		Message:            "All child resources have been deleted",
+		ObservedGeneration: stack.Generation,
+	})
+
+	if err := r.Status().Update(ctx, stack); err != nil {
+		log.Error(err, "Failed to update status for deletion complete")
+		// Continue with finalizer removal even if status update fails
+	}
+
+	// Remove finalizer
+	controllerutil.RemoveFinalizer(stack, stackFinalizerName)
+
+	// Clear the retry count annotation
+	if stack.Annotations != nil {
+		delete(stack.Annotations, deletionRetryCountAnnotation)
+	}
+
+	if err := r.Update(ctx, stack); err != nil {
+		log.Error(err, "Failed to remove finalizer")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Stack deletion complete, finalizer removed")
+	return ctrl.Result{}, nil
+}
+
+// handleDeletionTimeout handles the case when deletion has timed out.
+func (r *StackReconciler) handleDeletionTimeout(ctx context.Context, stack *envv1alpha1.Stack,
+	resourceList string, backoff time.Duration, retryCount int) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	message := fmt.Sprintf("Deletion timed out after %v. Blocked by: %s", deletionTimeout, resourceList)
+
+	// Emit timeout event (only on first timeout or periodically)
+	existingCondition := meta.FindStatusCondition(stack.Status.Conditions, envv1alpha1.StackConditionTypeDeleting)
+	if r.Recorder != nil && (existingCondition == nil || existingCondition.Reason != envv1alpha1.StackReasonDeletionFailed) {
+		r.Recorder.Event(stack, corev1.EventTypeWarning, "DeletionTimedOut", message)
+	}
+
+	// Update status to show deletion failed
+	meta.SetStatusCondition(&stack.Status.Conditions, metav1.Condition{
+		Type:               envv1alpha1.StackConditionTypeDeleting,
+		Status:             metav1.ConditionFalse,
+		Reason:             envv1alpha1.StackReasonDeletionFailed,
+		Message:            message,
+		ObservedGeneration: stack.Generation,
+	})
+
+	if err := r.Status().Update(ctx, stack); err != nil {
+		log.Error(err, "Failed to update status for deletion timeout")
+		return ctrl.Result{}, err
+	}
+
+	// Update retry count annotation
+	if err := r.updateDeletionRetryCount(ctx, stack, retryCount+1); err != nil {
+		log.Error(err, "Failed to update retry count annotation")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Deletion timed out, will continue retrying",
+		"blockedBy", resourceList,
+		"retryCount", retryCount+1,
+		"nextRetryIn", backoff)
+
+	// Continue retrying with exponential backoff for auto-recovery
+	return ctrl.Result{RequeueAfter: backoff}, nil
+}
+
+// handleDeletionInProgress handles deletion while still within timeout.
+func (r *StackReconciler) handleDeletionInProgress(ctx context.Context, stack *envv1alpha1.Stack,
+	resourceList string, backoff time.Duration, retryCount int, remainingCount int) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	message := fmt.Sprintf("Waiting for %d resource(s) to be deleted: %s", remainingCount, resourceList)
+
+	// Emit progress event on first attempt
+	if r.Recorder != nil && retryCount == 0 {
+		r.Recorder.Event(stack, corev1.EventTypeNormal, "DeletionStarted",
+			fmt.Sprintf("Starting deletion, waiting for %d child resource(s)", remainingCount))
+	}
+
+	// Update status to show deletion in progress
+	meta.SetStatusCondition(&stack.Status.Conditions, metav1.Condition{
+		Type:               envv1alpha1.StackConditionTypeDeleting,
+		Status:             metav1.ConditionTrue,
+		Reason:             envv1alpha1.StackReasonWaitingForChildren,
+		Message:            message,
+		ObservedGeneration: stack.Generation,
+	})
+
+	if err := r.Status().Update(ctx, stack); err != nil {
+		log.Error(err, "Failed to update status for deletion in progress")
+		return ctrl.Result{}, err
+	}
+
+	// Update retry count annotation
+	if err := r.updateDeletionRetryCount(ctx, stack, retryCount+1); err != nil {
+		log.Error(err, "Failed to update retry count annotation")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Waiting for child resources to be deleted",
+		"remaining", remainingCount,
+		"resources", resourceList,
+		"retryCount", retryCount+1,
+		"nextRetryIn", backoff)
+
+	return ctrl.Result{RequeueAfter: backoff}, nil
+}
+
+// getDeletionRetryCount returns the current deletion retry count from annotation.
+func (r *StackReconciler) getDeletionRetryCount(stack *envv1alpha1.Stack) int {
+	if stack.Annotations == nil {
+		return 0
+	}
+	countStr, ok := stack.Annotations[deletionRetryCountAnnotation]
+	if !ok {
+		return 0
+	}
+	count, err := strconv.Atoi(countStr)
+	if err != nil {
+		return 0
+	}
+	return count
+}
+
+// updateDeletionRetryCount updates the retry count annotation on the Stack.
+func (r *StackReconciler) updateDeletionRetryCount(ctx context.Context, stack *envv1alpha1.Stack, count int) error {
+	if stack.Annotations == nil {
+		stack.Annotations = make(map[string]string)
+	}
+	stack.Annotations[deletionRetryCountAnnotation] = strconv.Itoa(count)
+	return r.Update(ctx, stack)
+}
+
+// calculateDeletionBackoff calculates the backoff duration using exponential backoff.
+// Formula: min(5s × 2^retryCount, 5min) - matches K8s pod restart backoff pattern.
+func calculateDeletionBackoff(retryCount int) time.Duration {
+	backoff := deletionBackoffBase
+	for i := 0; i < retryCount; i++ {
+		backoff *= 2
+		if backoff >= deletionBackoffMax {
+			return deletionBackoffMax
+		}
+	}
+	return backoff
+}
+
+// formatResourceList formats a slice of resource identifiers into a comma-separated string.
+func formatResourceList(resources []string) string {
+	if len(resources) == 0 {
+		return ""
+	}
+	if len(resources) <= 5 {
+		return strings.Join(resources, ", ")
+	}
+	// Truncate if too many resources
+	return fmt.Sprintf("%s, ... and %d more", strings.Join(resources[:5], ", "), len(resources)-5)
 }
 
 // SetupWithManager sets up the controller with the Manager.

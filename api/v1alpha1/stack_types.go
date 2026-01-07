@@ -93,10 +93,27 @@ type StackMetadata struct {
 	Author string `json:"author,omitempty"`
 }
 
+// Stack condition types
+const (
+	// StackConditionTypeDeleting indicates the Stack is being deleted and waiting for child resources
+	StackConditionTypeDeleting = "Deleting"
+)
+
+// Stack condition reasons
+const (
+	// StackReasonWaitingForChildren indicates deletion is waiting for child resources to be removed
+	StackReasonWaitingForChildren = "WaitingForChildren"
+	// StackReasonDeletionFailed indicates deletion timed out with resources still remaining
+	StackReasonDeletionFailed = "DeletionFailed"
+	// StackReasonDeletionComplete indicates all child resources have been deleted
+	StackReasonDeletionComplete = "DeletionComplete"
+)
+
 // StackStatus defines the observed state of Stack.
 type StackStatus struct {
 	// Conditions track the status of each resource and overall stack state
 	// - Type="Ready": Overall stack readiness (Status=True/False)
+	// - Type="Deleting": Deletion progress (Status=True while deleting, False on timeout)
 	// - Type="Resource/{Kind}/{Name}": Individual resource status
 	//   Status=True (applied successfully), False (failed)
 	//   Reason="Applied" or "Failed"
