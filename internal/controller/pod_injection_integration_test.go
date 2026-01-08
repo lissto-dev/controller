@@ -67,6 +67,7 @@ var _ = Describe("Pod and Deployment Integration Tests", func() {
 				},
 			},
 		}
+		reconciler.InitServices()
 	})
 
 	AfterEach(func() {

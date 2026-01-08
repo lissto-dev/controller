@@ -68,6 +68,7 @@ var _ = Describe("Config Injection Hierarchy Tests", func() {
 				},
 			},
 		}
+		reconciler.InitServices()
 	})
 
 	AfterEach(func() {

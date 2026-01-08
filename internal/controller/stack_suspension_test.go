@@ -119,6 +119,7 @@ var _ = Describe("Stack Suspension", func() {
 				Config:   &config.Config{},
 				Recorder: record.NewFakeRecorder(10),
 			}
+			reconciler.InitServices()
 		})
 
 		AfterEach(func() {

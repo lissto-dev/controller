@@ -108,6 +108,7 @@ var _ = Describe("Stack Controller", func() {
 					},
 				},
 			}
+			controllerReconciler.InitServices()
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
@@ -147,6 +148,7 @@ var _ = Describe("Stack Controller", func() {
 					},
 				},
 			}
+			controllerReconciler.InitServices()
 
 			By("creating the required Blueprint")
 			blueprint := testdata.NewBlueprint(namespace, "cleanup-test-blueprint")
