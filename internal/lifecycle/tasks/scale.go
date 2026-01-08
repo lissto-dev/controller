@@ -57,7 +57,7 @@ func (e *ScaleExecutor) ExecuteScaleDown(ctx context.Context, lifecycle *envv1al
 		timeout = task.Timeout.Duration
 	}
 
-	var suspendedStacks []envv1alpha1.Stack
+	suspendedStacks := make([]envv1alpha1.Stack, 0, len(stackList.Items))
 	var errs []error
 
 	for i := range stackList.Items {

@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
+	"github.com/lissto-dev/controller/internal/controller/testdata"
 	"github.com/lissto-dev/controller/internal/stack/suspension"
 	"github.com/lissto-dev/controller/pkg/config"
 )
@@ -131,6 +132,10 @@ var _ = Describe("Stack Suspension", func() {
 		})
 
 		It("should transition stack through suspension phases", func() {
+			// Create ConfigMap with manifests
+			configMap := testdata.NewManifestsConfigMap(testNs, "test-manifests")
+			Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
+
 			// Create a stack
 			stack := &envv1alpha1.Stack{
 				ObjectMeta: metav1.ObjectMeta{
