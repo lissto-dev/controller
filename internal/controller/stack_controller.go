@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
+	"github.com/lissto-dev/controller/internal/stack/suspension"
 	"github.com/lissto-dev/controller/pkg/config"
 )
 
@@ -63,13 +65,10 @@ type StackReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Stack object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.1/pkg/reconcile
@@ -82,7 +81,8 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("Reconciling Stack", "name", stack.Name, "namespace", stack.Namespace)
+	log.Info("Reconciling Stack", "name", stack.Name, "namespace", stack.Namespace,
+		"suspension", stack.Spec.Suspension, "phase", stack.Status.Phase)
 
 	// Handle finalizer for cleanup
 	if stack.DeletionTimestamp.IsZero() {
@@ -140,6 +140,15 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	log.Info("Parsed manifests", "count", len(objects))
+
+	// Validate all resources have the required lissto.dev/class annotation
+	if err := suspension.ValidateResourceAnnotations(objects); err != nil {
+		log.Error(err, "Resource validation failed")
+		r.Recorder.Eventf(stack, corev1.EventTypeWarning, "ValidationFailed",
+			"Resource validation failed: %v", err)
+		r.updateStackStatus(ctx, stack, nil, nil, nil, err)
+		return ctrl.Result{}, err
+	}
 
 	// Fetch blueprint for config discovery
 	blueprint, err := r.getBlueprint(ctx, stack)
@@ -201,17 +210,119 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// Inject images from Stack spec into deployments
 	imageWarnings := r.injectImages(ctx, objects, stack.Spec.Images)
 
-	// Apply all resources
-	results := r.applyResources(ctx, objects, stack.Namespace)
+	// Categorize resources based on suspension state
+	stateResources, workloadsToApply, workloadsToDelete := suspension.CategorizeResources(stack, objects)
 
-	// Set owner references on successfully applied resources (after apply)
-	// This ensures they get garbage collected when Stack is deleted
-	r.setOwnerReferences(ctx, stack, objects, results)
+	log.Info("Resource categorization",
+		"stateResources", len(stateResources),
+		"workloadsToApply", len(workloadsToApply),
+		"workloadsToDelete", len(workloadsToDelete))
+
+	// Always apply state resources first (PVCs, etc.)
+	stateResults := r.applyResources(ctx, stateResources, stack.Namespace)
+	r.setOwnerReferences(ctx, stack, stateResources, stateResults)
+
+	// Handle volume restore if needed (only for state resources that are PVCs)
+	var pvcObjects []*unstructured.Unstructured
+	for _, obj := range stateResources {
+		if obj.GetKind() == "PersistentVolumeClaim" {
+			pvcObjects = append(pvcObjects, obj)
+		}
+	}
+
+	// Handle restore from StackSnapshot if specified
+	if r.needsRestore(stack) && len(pvcObjects) > 0 {
+		restoreComplete, restoreResults, err := r.restoreFromSnapshot(ctx, stack, pvcObjects)
+		if err != nil {
+			log.Error(err, "Failed to restore from snapshot")
+			r.Recorder.Eventf(stack, corev1.EventTypeWarning, "RestoreFailed",
+				"Failed to restore from snapshot: %v", err)
+		}
+
+		// Log restore results
+		for _, result := range restoreResults {
+			if result.Error != nil {
+				log.Error(result.Error, "Resource restore failed",
+					"service", result.Service,
+					"snapshot", result.SnapshotName)
+			}
+		}
+
+		if !restoreComplete {
+			log.Info("Restore in progress, requeuing", "results", len(restoreResults))
+			// Requeue to check restore status
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		log.Info("Restore complete", "results", len(restoreResults))
+	}
+
+	// Delete workloads that should be suspended
+	for _, obj := range workloadsToDelete {
+		if err := r.deleteWorkloadResource(ctx, obj, stack.Namespace); err != nil {
+			log.Error(err, "Failed to delete workload resource",
+				"kind", obj.GetKind(), "name", obj.GetName())
+		}
+	}
+
+	// Apply workloads that should be running
+	workloadResults := r.applyResources(ctx, workloadsToApply, stack.Namespace)
+	r.setOwnerReferences(ctx, stack, workloadsToApply, workloadResults)
+
+	// Check if all suspended workloads have terminated
+	allWorkloadsTerminated := true
+	if len(workloadsToDelete) > 0 {
+		terminated, err := r.waitForWorkloadsTermination(ctx, stack)
+		if err != nil {
+			log.Error(err, "Error checking workload termination")
+		}
+		allWorkloadsTerminated = terminated
+	}
+
+	// Determine and update phase
+	newPhase := suspension.DetermineStackPhase(stack, allWorkloadsTerminated)
+	oldPhase := stack.Status.Phase
+
+	if oldPhase != newPhase {
+		var reason, message string
+		switch newPhase {
+		case envv1alpha1.StackPhaseSuspending:
+			reason = "Suspending"
+			message = fmt.Sprintf("Suspending stack, deleting %d workload resources", len(workloadsToDelete))
+		case envv1alpha1.StackPhaseSuspended:
+			reason = "Suspended"
+			message = fmt.Sprintf("Stack suspended, %d state resources preserved", len(stateResources))
+		case envv1alpha1.StackPhaseResuming:
+			reason = "Resuming"
+			message = fmt.Sprintf("Resuming stack, recreating %d workload resources", len(workloadsToApply))
+		case envv1alpha1.StackPhaseRunning:
+			if oldPhase == "" {
+				reason = "StackCreated"
+				message = "Stack created and all resources applied"
+			} else {
+				reason = "Running"
+				message = fmt.Sprintf("Stack running, %d resources applied", len(stateResources)+len(workloadsToApply))
+			}
+		}
+		r.transitionPhase(ctx, stack, newPhase, reason, message)
+	}
+
+	// Update per-service statuses
+	r.updateServiceStatuses(ctx, stack, objects)
+
+	// Combine results for status update
+	results := append(stateResults, workloadResults...)
 
 	// Update Stack status with results
 	r.updateStackStatus(ctx, stack, results, imageWarnings, configResult, nil)
 
-	log.Info("Stack reconciliation complete", "name", stack.Name)
+	// If we're still suspending, requeue to check termination
+	if stack.Status.Phase == envv1alpha1.StackPhaseSuspending {
+		log.Info("Stack suspending, requeuing to check termination")
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	log.Info("Stack reconciliation complete", "name", stack.Name, "phase", stack.Status.Phase)
 	return ctrl.Result{}, nil
 }
 
@@ -779,6 +890,120 @@ func (r *StackReconciler) cleanupStackResources(ctx context.Context, stack *envv
 	}
 
 	return nil
+}
+
+// cleanupConfigSecrets cleans up orphaned config secrets that may not have owner references
+// Deprecated: Use cleanupStackResources instead
+func (r *StackReconciler) cleanupConfigSecrets(ctx context.Context, stack *envv1alpha1.Stack) error {
+	log := logf.FromContext(ctx)
+
+	// Find all secrets with our managed-by label
+	secretList := &corev1.SecretList{}
+	if err := r.List(ctx, secretList,
+		client.InNamespace(stack.Namespace),
+		client.MatchingLabels{
+			"lissto.dev/managed-by": "stack-controller",
+			"lissto.dev/stack":      stack.Name,
+		}); err != nil {
+		return fmt.Errorf("failed to list managed secrets: %w", err)
+	}
+
+	// Delete all managed secrets for this stack
+	for i := range secretList.Items {
+		secret := &secretList.Items[i]
+		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "Failed to delete config secret", "secret", secret.Name)
+			// Continue trying to delete others
+		} else {
+			log.Info("Deleted config secret", "secret", secret.Name)
+		}
+	}
+
+	log.Info("Cleaned up config secrets", "count", len(secretList.Items))
+	return nil
+}
+
+// RestoreResult tracks the result of a volume restore operation
+type RestoreResult struct {
+	Service        string
+	PVCName        string
+	SnapshotName   string
+	JobName        string
+	Status         string // "pending", "running", "completed", "failed"
+	Error          error
+}
+
+// needsRestore checks if the stack has a restore spec
+func (r *StackReconciler) needsRestore(stack *envv1alpha1.Stack) bool {
+	return stack.Spec.Restore != nil && stack.Spec.Restore.SnapshotRef != ""
+}
+
+// isRestoreComplete checks if restore has already completed
+func (r *StackReconciler) isRestoreComplete(stack *envv1alpha1.Stack) bool {
+	return stack.Status.RestoreStatus != nil &&
+		stack.Status.RestoreStatus.Phase == envv1alpha1.RestorePhaseCompleted
+}
+
+// restoreFromSnapshot handles restoration from a StackSnapshot
+// Returns true if restore is complete, false if still in progress
+// TODO: Implement in Phase 5 - Stack Restore
+func (r *StackReconciler) restoreFromSnapshot(ctx context.Context, stack *envv1alpha1.Stack, pvcObjects []*unstructured.Unstructured) (bool, []RestoreResult, error) {
+	log := logf.FromContext(ctx)
+
+	// Skip if no restore needed or already complete
+	if !r.needsRestore(stack) || r.isRestoreComplete(stack) {
+		return true, nil, nil
+	}
+
+	log.Info("Restore from StackSnapshot not yet implemented",
+		"snapshotRef", stack.Spec.Restore.SnapshotRef)
+
+	// TODO: Phase 5 implementation:
+	// 1. Fetch StackSnapshot by spec.restore.snapshotRef
+	// 2. Filter resources by include/exclude
+	// 3. For each resource:
+	//    - Download from S3 → Decrypt → Decompress
+	//    - ConfigMaps/Secrets: Apply directly with owner reference
+	//    - PVCs: Create PVC, run restore Job to populate data
+	// 4. Update status.restoreStatus
+
+	// For now, mark as complete to not block reconciliation
+	return true, nil, nil
+}
+
+// findPVCForRestore finds the PVC name that matches the service and mount path
+func (r *StackReconciler) findPVCForRestore(pvcObjects []*unstructured.Unstructured, serviceName, mountPath string) string {
+	for _, obj := range pvcObjects {
+		if obj.GetKind() != "PersistentVolumeClaim" {
+			continue
+		}
+
+		labels := obj.GetLabels()
+		annotations := obj.GetAnnotations()
+
+		// Check if PVC belongs to the service
+		pvcService := labels["io.kompose.service"]
+		if pvcService == "" {
+			pvcService = labels["app.kubernetes.io/component"]
+		}
+		if pvcService == "" {
+			pvcService = labels["app"]
+		}
+
+		if pvcService != serviceName {
+			continue
+		}
+
+		// Check mount path if specified
+		pvcMountPath := annotations["env.lissto.dev/mount-path"]
+		if mountPath != "" && pvcMountPath != "" && pvcMountPath != mountPath {
+			continue
+		}
+
+		return obj.GetName()
+	}
+
+	return ""
 }
 
 // SetupWithManager sets up the controller with the Manager.
