@@ -4,6 +4,100 @@ metadata:
   labels:
     app.kubernetes.io/name: operator
     app.kubernetes.io/managed-by: kustomize
+    lissto.dev/user: acme
+    lissto.dev/repo: myrepo
   name: stack-sample
+  namespace: dev-user
 spec:
-  # TODO(user): Add fields here
+  blueprintReference: my-blueprint
+  manifestsConfigMapRef: my-manifests
+  env: dev
+  images:
+    web:
+      digest: "sha256:abc123..."
+      image: "myapp:v1.0.0"
+    postgres:
+      digest: "sha256:def456..."
+      image: "postgres:15"
+  
+  # Suspension settings (optional)
+  # suspension:
+  #   services: ["*"]    # Suspend all services, or list specific ones
+  #   timeout: 5m        # Timeout for workload termination
+---
+# Example: Stack with all services suspended
+apiVersion: env.lissto.dev/v1alpha1
+kind: Stack
+metadata:
+  name: stack-suspended
+  namespace: dev-user
+  labels:
+    lissto.dev/user: acme
+    lissto.dev/repo: myrepo
+spec:
+  blueprintReference: my-blueprint
+  manifestsConfigMapRef: my-manifests
+  env: dev
+  images:
+    web:
+      digest: "sha256:abc123..."
+    postgres:
+      digest: "sha256:def456..."
+  
+  # Suspend all services (workloads deleted, state preserved)
+  suspension:
+    services: ["*"]
+    timeout: 5m
+---
+# Example: Stack with per-service suspension
+apiVersion: env.lissto.dev/v1alpha1
+kind: Stack
+metadata:
+  name: stack-with-suspended-worker
+  namespace: dev-user
+  labels:
+    lissto.dev/user: acme
+    lissto.dev/repo: myrepo
+spec:
+  blueprintReference: my-blueprint
+  manifestsConfigMapRef: my-manifests
+  env: dev
+  images:
+    web:
+      digest: "sha256:abc123..."
+    worker:
+      digest: "sha256:ghi789..."
+    postgres:
+      digest: "sha256:def456..."
+  
+  # Suspend only the worker service (web and postgres keep running)
+  suspension:
+    services:
+      - worker
+---
+# Example: Stack restored from a snapshot
+apiVersion: env.lissto.dev/v1alpha1
+kind: Stack
+metadata:
+  name: stack-restored
+  namespace: dev-user
+  labels:
+    lissto.dev/user: acme
+    lissto.dev/repo: myrepo
+spec:
+  blueprintReference: my-blueprint
+  manifestsConfigMapRef: my-manifests
+  env: dev
+  images:
+    web:
+      digest: "sha256:abc123..."
+    postgres:
+      digest: "sha256:def456..."
+  
+  # Restore state resources from a snapshot
+  restore:
+    snapshotRef: stack-sample-20260107-120000
+    # Optionally exclude specific resources
+    # exclude:
+    #   - kind: PersistentVolumeClaim
+    #     name: old-data

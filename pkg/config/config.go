@@ -4,9 +4,15 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/lissto-dev/controller/pkg/namespace"
 	"gopkg.in/yaml.v3"
+)
+
+// Default values
+const (
+	DefaultSuspendTimeout = 5 * time.Minute
 )
 
 // Config holds the operator configuration
@@ -16,6 +22,14 @@ type Config struct {
 	Namespaces NamespacesConfig      `yaml:"namespaces"`
 	Repos      map[string]RepoConfig `yaml:"repos"`
 	Stacks     StacksConfig          `yaml:"stacks"`
+}
+
+// GetSuspendTimeout returns the configured suspend timeout or the default
+func (c *Config) GetSuspendTimeout() time.Duration {
+	if c.Stacks.Suspension != nil && c.Stacks.Suspension.Timeout > 0 {
+		return c.Stacks.Suspension.Timeout
+	}
+	return DefaultSuspendTimeout
 }
 
 // APIConfig holds API configuration
@@ -65,8 +79,17 @@ type RepoConfig struct {
 
 // StacksConfig holds stack configuration
 type StacksConfig struct {
-	Images  ImagesConfig  `yaml:"images,omitempty"`
-	Ingress IngressConfig `yaml:"ingress"`
+	Images     ImagesConfig      `yaml:"images,omitempty"`
+	Ingress    IngressConfig     `yaml:"ingress"`
+	Suspension *SuspensionConfig `yaml:"suspension,omitempty"`
+}
+
+// SuspensionConfig holds stack suspension configuration
+type SuspensionConfig struct {
+	// Timeout is the default timeout for waiting for workloads to terminate
+	// when suspending a stack. Can be overridden per-stack via spec.suspension.timeout.
+	// Default: 5m
+	Timeout time.Duration `yaml:"timeout,omitempty"`
 }
 
 // IngressConfig holds ingress configurations for different visibility types

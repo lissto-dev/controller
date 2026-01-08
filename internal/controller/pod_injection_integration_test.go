@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
@@ -59,14 +60,16 @@ var _ = Describe("Pod and Deployment Integration Tests", func() {
 
 		// Initialize reconciler with config
 		reconciler = &StackReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(10),
 			Config: &config.Config{
 				Namespaces: config.NamespacesConfig{
 					Global: "lissto-global",
 				},
 			},
 		}
+		reconciler.InitServices()
 	})
 
 	AfterEach(func() {

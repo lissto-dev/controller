@@ -11,6 +11,8 @@ const BasicManifest = `apiVersion: v1
 kind: Service
 metadata:
   name: test-service
+  annotations:
+    lissto.dev/class: state
 spec:
   selector:
     app: test
@@ -32,6 +34,8 @@ metadata:
   name: {{ .Name }}
   labels:
     io.kompose.service: {{ .Name }}
+  annotations:
+    lissto.dev/class: workload
 spec:
   replicas: 1
   selector:
@@ -62,6 +66,8 @@ metadata:
   name: {{ .Name }}
   labels:
     io.kompose.service: {{ .Name }}
+  annotations:
+    lissto.dev/class: workload
 spec:
   restartPolicy: Never
   containers:

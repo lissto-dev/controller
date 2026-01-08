@@ -24,3 +24,24 @@ spec:
     - name: delete-stale-blueprints
       delete:
         olderThan: 168h  # 7 days
+---
+# Example: Scheduled volume snapshots with stack suspension
+# This lifecycle suspends stacks, takes snapshots, then resumes them
+apiVersion: env.lissto.dev/v1alpha1
+kind: Lifecycle
+metadata:
+  name: nightly-snapshots
+spec:
+  targetKind: Stack
+  labelSelector:
+    matchLabels:
+      backup: enabled
+  interval: 24h
+  tasks:
+    - name: suspend-stacks
+      scaleDown:
+        timeout: 5m
+    - name: create-snapshots
+      snapshot: {}
+    - name: resume-stacks
+      scaleUp: {}
