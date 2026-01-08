@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sunstructured "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -175,8 +176,8 @@ var _ = Describe("Stack Suspension", func() {
 	})
 })
 
-func makeTestResources() []*unstructured.Unstructured {
-	return []*unstructured.Unstructured{
+func makeTestResources() []*k8sunstructured.Unstructured {
+	return []*k8sunstructured.Unstructured{
 		makeUnstructured("PersistentVolumeClaim", "postgres-data", "state", "postgres"),
 		makeUnstructured("Deployment", "web", "workload", "web"),
 		makeUnstructured("Deployment", "worker", "workload", "worker"),
@@ -192,13 +193,8 @@ func randString(n int) string {
 	return string(b)
 }
 
-// unstructured is imported from k8s.io/apimachinery/pkg/apis/meta/v1/unstructured
-type unstructured = struct {
-	Object map[string]interface{}
-}
-
-func makeUnstructured(kind, name, class, service string) *unstructured {
-	obj := &unstructured{
+func makeUnstructured(kind, name, class, service string) *k8sunstructured.Unstructured {
+	obj := &k8sunstructured.Unstructured{
 		Object: map[string]interface{}{
 			"kind": kind,
 			"metadata": map[string]interface{}{
