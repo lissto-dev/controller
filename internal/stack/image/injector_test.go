@@ -309,6 +309,6 @@ func getContainerImage(obj *unstructured.Unstructured) string {
 		return ""
 	}
 
-	image, _, _ := unstructured.NestedString(containerMap, "image")
-	return image
+	img, _, _ := unstructured.NestedString(containerMap, "image")
+	return img
 }

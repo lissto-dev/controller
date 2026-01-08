@@ -79,8 +79,8 @@ type RepoConfig struct {
 
 // StacksConfig holds stack configuration
 type StacksConfig struct {
-	Images     ImagesConfig     `yaml:"images,omitempty"`
-	Ingress    IngressConfig    `yaml:"ingress"`
+	Images     ImagesConfig      `yaml:"images,omitempty"`
+	Ingress    IngressConfig     `yaml:"ingress"`
 	Suspension *SuspensionConfig `yaml:"suspension,omitempty"`
 }
 

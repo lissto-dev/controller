@@ -107,8 +107,8 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		"suspension", stack.Spec.Suspension, "phase", stack.Status.Phase)
 
 	// Handle finalizer
-	if result, done := r.handleFinalizer(ctx, stack); done {
-		return result, nil
+	if shouldReturn, err := r.handleFinalizer(ctx, stack); shouldReturn {
+		return ctrl.Result{}, err
 	}
 
 	// Fetch and parse manifests
@@ -195,8 +195,9 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	return ctrl.Result{}, nil
 }
 
-// handleFinalizer manages the stack finalizer
-func (r *StackReconciler) handleFinalizer(ctx context.Context, stack *envv1alpha1.Stack) (ctrl.Result, bool) {
+// handleFinalizer manages the stack finalizer.
+// Returns (shouldReturn, err) where shouldReturn indicates if the caller should return early.
+func (r *StackReconciler) handleFinalizer(ctx context.Context, stack *envv1alpha1.Stack) (bool, error) {
 	log := logf.FromContext(ctx)
 
 	if stack.DeletionTimestamp.IsZero() {
@@ -204,29 +205,29 @@ func (r *StackReconciler) handleFinalizer(ctx context.Context, stack *envv1alpha
 			controllerutil.AddFinalizer(stack, stackFinalizerName)
 			if err := r.Update(ctx, stack); err != nil {
 				log.Error(err, "Failed to add finalizer")
-				return ctrl.Result{}, true
+				return true, err
 			}
 			log.Info("Added finalizer to Stack")
 		}
-		return ctrl.Result{}, false
+		return false, nil
 	}
 
 	// Stack is being deleted
 	if controllerutil.ContainsFinalizer(stack, stackFinalizerName) {
 		if err := r.resourceCleaner.CleanupStackResources(ctx, stack.Name, stack.Namespace, stack.UID); err != nil {
 			log.Error(err, "Failed to cleanup stack resources")
-			return ctrl.Result{}, true
+			return true, err
 		}
 
 		controllerutil.RemoveFinalizer(stack, stackFinalizerName)
 		if err := r.Update(ctx, stack); err != nil {
 			log.Error(err, "Failed to remove finalizer")
-			return ctrl.Result{}, true
+			return true, err
 		}
 		log.Info("Removed finalizer from Stack")
 	}
 
-	return ctrl.Result{}, true
+	return true, nil
 }
 
 // fetchAndParseManifests fetches and parses manifests from ConfigMap
@@ -420,14 +421,6 @@ func (r *StackReconciler) getBlueprint(ctx context.Context, stack *envv1alpha1.S
 	}
 
 	return blueprint, nil
-}
-
-// getSuspendTimeout returns the suspend timeout for the stack
-func (r *StackReconciler) getSuspendTimeout(stack *envv1alpha1.Stack) time.Duration {
-	if stack.Spec.Suspension != nil && stack.Spec.Suspension.Timeout != nil {
-		return stack.Spec.Suspension.Timeout.Duration
-	}
-	return r.Config.GetSuspendTimeout()
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -17,8 +17,8 @@ limitations under the License.
 package tasks
 
 import (
-	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 // BuildSelector creates a label selector from a LabelSelector spec
