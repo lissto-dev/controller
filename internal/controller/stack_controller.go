@@ -19,7 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -40,7 +42,16 @@ import (
 	"github.com/lissto-dev/controller/pkg/config"
 )
 
-const stackFinalizerName = "stack.lissto.dev/config-cleanup"
+const (
+	stackFinalizerName = "stack.lissto.dev/config-cleanup"
+
+	// Deletion timeout after which we mark as failed (but continue retrying)
+	deletionTimeout = 5 * time.Minute
+
+	// Deletion backoff parameters
+	deletionBackoffBase = 5 * time.Second
+	deletionBackoffMax  = 5 * time.Minute
+)
 
 // StackReconciler reconciles a Stack object
 type StackReconciler struct {
@@ -96,22 +107,9 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			log.Info("Added finalizer to Stack")
 		}
 	} else {
-		// Stack is being deleted, run cleanup
+		// Stack is being deleted, run cleanup with deletion protection
 		if controllerutil.ContainsFinalizer(stack, stackFinalizerName) {
-			// Run comprehensive cleanup as safety net
-			// Owner references should handle most cleanup, but this ensures everything is gone
-			if err := r.cleanupStackResources(ctx, stack); err != nil {
-				log.Error(err, "Failed to cleanup stack resources")
-				return ctrl.Result{}, err
-			}
-
-			// Remove finalizer
-			controllerutil.RemoveFinalizer(stack, stackFinalizerName)
-			if err := r.Update(ctx, stack); err != nil {
-				log.Error(err, "Failed to remove finalizer")
-				return ctrl.Result{}, err
-			}
-			log.Info("Removed finalizer from Stack")
+			return r.handleStackDeletion(ctx, stack)
 		}
 		// Stop reconciliation as the Stack is being deleted
 		return ctrl.Result{}, nil
@@ -779,6 +777,208 @@ func (r *StackReconciler) cleanupStackResources(ctx context.Context, stack *envv
 	}
 
 	return nil
+}
+
+// handleStackDeletion manages the Stack deletion process with protection.
+// It waits for all child resources to be deleted before removing the finalizer.
+func (r *StackReconciler) handleStackDeletion(ctx context.Context, stack *envv1alpha1.Stack) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	// Issue delete calls for owned resources (idempotent)
+	if err := r.cleanupStackResources(ctx, stack); err != nil {
+		log.Error(err, "Failed to cleanup stack resources")
+		return ctrl.Result{}, err
+	}
+
+	// Get remaining resources from status conditions + label verification
+	remaining := r.getRemainingResources(ctx, stack)
+	if len(remaining) == 0 {
+		return r.completeDeletion(ctx, stack)
+	}
+
+	// Calculate backoff from elapsed time (no annotation needed)
+	elapsed := time.Since(stack.DeletionTimestamp.Time)
+	backoff := calculateBackoffFromElapsed(elapsed)
+	timedOut := elapsed >= deletionTimeout
+	resourceList := formatResourceList(remaining)
+
+	// Emit events on state transitions
+	r.emitDeletionEvent(stack, timedOut, len(remaining), resourceList)
+
+	// Update status condition
+	r.setDeletionCondition(stack, timedOut, len(remaining), resourceList)
+	if err := r.Status().Update(ctx, stack); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Waiting for child resources", "remaining", len(remaining), "elapsed", elapsed, "nextRetry", backoff)
+	return ctrl.Result{RequeueAfter: backoff}, nil
+}
+
+// getRemainingResources returns resources that still exist, using status conditions as primary
+// source and label selector as verification to catch any leftovers.
+func (r *StackReconciler) getRemainingResources(ctx context.Context, stack *envv1alpha1.Stack) []string {
+	remaining := make([]string, 0, len(stack.Status.Conditions))
+	seen := make(map[string]bool)
+
+	// Primary: Check resources tracked in status conditions (Resource-{kind}-{name} format)
+	for _, cond := range stack.Status.Conditions {
+		if !strings.HasPrefix(cond.Type, "Resource-") {
+			continue
+		}
+		parts := strings.SplitN(strings.TrimPrefix(cond.Type, "Resource-"), "-", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		kind, name := parts[0], parts[1]
+		key := fmt.Sprintf("%s/%s", kind, name)
+		if seen[key] || !r.resourceExists(ctx, stack.Namespace, kind, name) {
+			continue
+		}
+		remaining = append(remaining, key)
+		seen[key] = true
+	}
+
+	// Verification: Also check for any resources with stack label (catches leftovers)
+	for _, key := range r.findLabeledResources(ctx, stack) {
+		if !seen[key] {
+			remaining = append(remaining, key)
+			seen[key] = true
+		}
+	}
+	return remaining
+}
+
+// resourceExists checks if a resource of the given kind/name exists in the namespace.
+func (r *StackReconciler) resourceExists(ctx context.Context, namespace, kind, name string) bool {
+	var obj client.Object
+	switch strings.ToLower(kind) {
+	case "deployment":
+		obj = &appsv1.Deployment{}
+	case "service":
+		obj = &corev1.Service{}
+	case "ingress":
+		obj = &networkingv1.Ingress{}
+	case "persistentvolumeclaim":
+		obj = &corev1.PersistentVolumeClaim{}
+	case "secret":
+		obj = &corev1.Secret{}
+	case "pod":
+		obj = &corev1.Pod{}
+	default:
+		return false
+	}
+	return r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, obj) == nil
+}
+
+// findLabeledResources finds all resources with the stack label (for verification).
+func (r *StackReconciler) findLabeledResources(ctx context.Context, stack *envv1alpha1.Stack) []string {
+	var resources []string
+	listOpts := []client.ListOption{
+		client.InNamespace(stack.Namespace),
+		client.MatchingLabels{"lissto.dev/stack": stack.Name},
+	}
+
+	types := []struct {
+		kind string
+		list client.ObjectList
+	}{
+		{"Deployment", &appsv1.DeploymentList{}},
+		{"Service", &corev1.ServiceList{}},
+		{"Ingress", &networkingv1.IngressList{}},
+		{"PersistentVolumeClaim", &corev1.PersistentVolumeClaimList{}},
+		{"Secret", &corev1.SecretList{}},
+		{"Pod", &corev1.PodList{}},
+	}
+
+	for _, t := range types {
+		if err := r.List(ctx, t.list, listOpts...); err != nil {
+			continue
+		}
+		items, _ := meta.ExtractList(t.list)
+		for _, item := range items {
+			if obj, ok := item.(client.Object); ok {
+				resources = append(resources, fmt.Sprintf("%s/%s", t.kind, obj.GetName()))
+			}
+		}
+	}
+	return resources
+}
+
+// completeDeletion removes the finalizer and emits completion event.
+func (r *StackReconciler) completeDeletion(ctx context.Context, stack *envv1alpha1.Stack) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	if r.Recorder != nil {
+		r.Recorder.Event(stack, corev1.EventTypeNormal, "DeletionComplete", "All child resources deleted")
+	}
+
+	controllerutil.RemoveFinalizer(stack, stackFinalizerName)
+	if err := r.Update(ctx, stack); err != nil {
+		log.Error(err, "Failed to remove finalizer")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Stack deletion complete, finalizer removed")
+	return ctrl.Result{}, nil
+}
+
+// emitDeletionEvent emits appropriate events for deletion state transitions.
+func (r *StackReconciler) emitDeletionEvent(stack *envv1alpha1.Stack, timedOut bool, remaining int, resourceList string) {
+	if r.Recorder == nil {
+		return
+	}
+	existing := meta.FindStatusCondition(stack.Status.Conditions, envv1alpha1.StackConditionTypeDeleting)
+
+	if existing == nil {
+		r.Recorder.Event(stack, corev1.EventTypeNormal, "DeletionStarted",
+			fmt.Sprintf("Waiting for %d child resource(s)", remaining))
+	} else if timedOut && existing.Reason != envv1alpha1.StackReasonDeletionFailed {
+		r.Recorder.Event(stack, corev1.EventTypeWarning, "DeletionTimedOut",
+			fmt.Sprintf("Timed out after %v. Blocked by: %s", deletionTimeout, resourceList))
+	}
+}
+
+// setDeletionCondition sets the appropriate deletion status condition.
+func (r *StackReconciler) setDeletionCondition(stack *envv1alpha1.Stack, timedOut bool, remaining int, resourceList string) {
+	var reason, message string
+	var status metav1.ConditionStatus
+
+	if timedOut {
+		status, reason = metav1.ConditionFalse, envv1alpha1.StackReasonDeletionFailed
+		message = fmt.Sprintf("Timed out after %v. Blocked by: %s", deletionTimeout, resourceList)
+	} else {
+		status, reason = metav1.ConditionTrue, envv1alpha1.StackReasonWaitingForChildren
+		message = fmt.Sprintf("Waiting for %d resource(s): %s", remaining, resourceList)
+	}
+
+	meta.SetStatusCondition(&stack.Status.Conditions, metav1.Condition{
+		Type: envv1alpha1.StackConditionTypeDeleting, Status: status, Reason: reason,
+		Message: message, ObservedGeneration: stack.Generation,
+	})
+}
+
+// calculateBackoffFromElapsed calculates exponential backoff based on elapsed time.
+// Uses 5s base with 2x factor, capped at 5min. No state tracking needed.
+func calculateBackoffFromElapsed(elapsed time.Duration) time.Duration {
+	if elapsed <= 0 {
+		return deletionBackoffBase
+	}
+	// Calculate step based on elapsed time: step = log2(elapsed/base + 1)
+	steps := int(math.Log2(float64(elapsed)/float64(deletionBackoffBase) + 1))
+	backoff := deletionBackoffBase * time.Duration(1<<steps)
+	if backoff > deletionBackoffMax {
+		return deletionBackoffMax
+	}
+	return backoff
+}
+
+// formatResourceList formats resources into a comma-separated string, truncating if needed.
+func formatResourceList(resources []string) string {
+	if len(resources) <= 5 {
+		return strings.Join(resources, ", ")
+	}
+	return fmt.Sprintf("%s, ... and %d more", strings.Join(resources[:5], ", "), len(resources)-5)
 }
 
 // SetupWithManager sets up the controller with the Manager.
