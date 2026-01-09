@@ -33,11 +33,16 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
+	"github.com/lissto-dev/controller/internal/controller/snapshot"
+	"github.com/lissto-dev/controller/pkg/config"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
 	lifecycleFinalizerName = "lifecycle.env.lissto.dev/finalizer"
+
+	// DefaultStackSuspendTimeout is the default timeout for waiting for stack suspension
+	DefaultStackSuspendTimeout = 5 * time.Minute
 )
 
 // workerHandle holds the cancel function and metadata for a running worker
@@ -52,6 +57,7 @@ type LifecycleReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+	Config   *config.Config
 
 	// workers tracks active worker goroutines by Lifecycle name
 	workers map[string]workerHandle
@@ -63,6 +69,12 @@ type LifecycleReconciler struct {
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=lifecycles/finalizers,verbs=update
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=stacks,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=blueprints,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=env.lissto.dev,resources=volumesnapshots,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile handles Lifecycle object changes
@@ -233,6 +245,9 @@ func (r *LifecycleReconciler) executeTasks(ctx context.Context, lifecycleName st
 	stats := &envv1alpha1.RunStats{}
 	var successCount, failCount int64
 
+	// Track stacks that have been scaled down for snapshot tasks
+	var scaledDownStacks []envv1alpha1.Stack
+
 	for i, task := range lifecycle.Spec.Tasks {
 		taskName := task.Name
 		if taskName == "" {
@@ -252,6 +267,46 @@ func (r *LifecycleReconciler) executeTasks(ctx context.Context, lifecycleName st
 			} else {
 				successCount++
 				log.Info("Delete task completed", "task", taskName, "deleted", deleted, "evaluated", evaluated)
+			}
+		}
+
+		if task.ScaleDown != nil {
+			stacks, err := r.executeScaleDownTask(ctx, &lifecycle, task.ScaleDown)
+			if err != nil {
+				failCount++
+				r.Recorder.Eventf(&lifecycle, corev1.EventTypeWarning, "TaskFailed",
+					"Task %s failed: %v", taskName, err)
+				log.Error(err, "ScaleDown task failed", "task", taskName)
+			} else {
+				successCount++
+				scaledDownStacks = stacks
+				log.Info("ScaleDown task completed", "task", taskName, "stacksScaled", len(stacks))
+			}
+		}
+
+		if task.Snapshot != nil {
+			snapshotsCreated, err := r.executeSnapshotTask(ctx, &lifecycle, scaledDownStacks)
+			if err != nil {
+				failCount++
+				r.Recorder.Eventf(&lifecycle, corev1.EventTypeWarning, "TaskFailed",
+					"Task %s failed: %v", taskName, err)
+				log.Error(err, "Snapshot task failed", "task", taskName)
+			} else {
+				successCount++
+				log.Info("Snapshot task completed", "task", taskName, "snapshotsCreated", snapshotsCreated)
+			}
+		}
+
+		if task.ScaleUp != nil {
+			err := r.executeScaleUpTask(ctx, &lifecycle, scaledDownStacks)
+			if err != nil {
+				failCount++
+				r.Recorder.Eventf(&lifecycle, corev1.EventTypeWarning, "TaskFailed",
+					"Task %s failed: %v", taskName, err)
+				log.Error(err, "ScaleUp task failed", "task", taskName)
+			} else {
+				successCount++
+				log.Info("ScaleUp task completed", "task", taskName)
 			}
 		}
 	}
@@ -336,6 +391,25 @@ func (r *LifecycleReconciler) executeDeleteTask(ctx context.Context, lifecycle *
 			}
 		}
 
+	case "VolumeSnapshot":
+		var snapshotList envv1alpha1.VolumeSnapshotList
+		if err := r.List(ctx, &snapshotList, listOpts); err != nil {
+			return 0, 0, fmt.Errorf("failed to list VolumeSnapshots: %w", err)
+		}
+
+		evaluated = int64(len(snapshotList.Items))
+		for i := range snapshotList.Items {
+			vs := &snapshotList.Items[i]
+			if vs.CreationTimestamp.Time.Before(threshold) {
+				log.Info("Deleting VolumeSnapshot", "name", vs.Name, "namespace", vs.Namespace, "age", now.Sub(vs.CreationTimestamp.Time))
+				if err := r.Delete(ctx, vs); err != nil {
+					errs = append(errs, fmt.Errorf("VolumeSnapshot %s/%s: %w", vs.Namespace, vs.Name, err))
+				} else {
+					deleted++
+				}
+			}
+		}
+
 	default:
 		return 0, 0, fmt.Errorf("unsupported target kind: %s", lifecycle.Spec.TargetKind)
 	}
@@ -346,6 +420,303 @@ func (r *LifecycleReconciler) executeDeleteTask(ctx context.Context, lifecycle *
 	}
 
 	return deleted, evaluated, nil
+}
+
+// executeScaleDownTask suspends all matching stacks by setting spec.suspended=true
+func (r *LifecycleReconciler) executeScaleDownTask(ctx context.Context, lifecycle *envv1alpha1.Lifecycle, task *envv1alpha1.ScaleDownTask) ([]envv1alpha1.Stack, error) {
+	log := logf.FromContext(ctx).WithValues("lifecycle", lifecycle.Name)
+
+	// Only works for Stack target kind
+	if lifecycle.Spec.TargetKind != "Stack" {
+		return nil, fmt.Errorf("scaleDown task only supports Stack targetKind, got %s", lifecycle.Spec.TargetKind)
+	}
+
+	// Get timeout
+	timeout := DefaultStackSuspendTimeout
+	if task.Timeout.Duration > 0 {
+		timeout = task.Timeout.Duration
+	}
+
+	// Build label selector
+	var selector labels.Selector
+	if lifecycle.Spec.LabelSelector != nil {
+		var err error
+		selector, err = metav1.LabelSelectorAsSelector(lifecycle.Spec.LabelSelector)
+		if err != nil {
+			return nil, fmt.Errorf("invalid label selector: %w", err)
+		}
+	} else {
+		selector = labels.Everything()
+	}
+
+	// List matching stacks
+	var stackList envv1alpha1.StackList
+	if err := r.List(ctx, &stackList, &client.ListOptions{LabelSelector: selector}); err != nil {
+		return nil, fmt.Errorf("failed to list Stacks: %w", err)
+	}
+
+	var suspendedStacks []envv1alpha1.Stack
+	var errs []error
+
+	// Set suspended=true on all matching stacks
+	for i := range stackList.Items {
+		stack := &stackList.Items[i]
+
+		// Skip if already suspended
+		if stack.Spec.Suspended {
+			log.Info("Stack already suspended", "stack", stack.Name, "namespace", stack.Namespace)
+			suspendedStacks = append(suspendedStacks, *stack)
+			continue
+		}
+
+		log.Info("Suspending stack", "stack", stack.Name, "namespace", stack.Namespace)
+
+		// Update stack to suspended
+		stack.Spec.Suspended = true
+		if err := r.Update(ctx, stack); err != nil {
+			errs = append(errs, fmt.Errorf("failed to suspend stack %s/%s: %w", stack.Namespace, stack.Name, err))
+			continue
+		}
+
+		suspendedStacks = append(suspendedStacks, *stack)
+	}
+
+	// Wait for all stacks to reach Suspended phase
+	if err := r.waitForStacksPhase(ctx, suspendedStacks, envv1alpha1.StackPhaseSuspended, timeout); err != nil {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		return suspendedStacks, fmt.Errorf("failed to suspend %d stack(s): %v", len(errs), errs)
+	}
+
+	return suspendedStacks, nil
+}
+
+// waitForStacksPhase waits for all stacks to reach the desired phase
+func (r *LifecycleReconciler) waitForStacksPhase(ctx context.Context, stacks []envv1alpha1.Stack, desiredPhase envv1alpha1.StackPhase, timeout time.Duration) error {
+	log := logf.FromContext(ctx)
+
+	if len(stacks) == 0 {
+		return nil
+	}
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				return fmt.Errorf("timeout waiting for stacks to reach phase %s", desiredPhase)
+			}
+
+			allReady := true
+			for _, stack := range stacks {
+				// Fetch current stack state
+				var currentStack envv1alpha1.Stack
+				if err := r.Get(ctx, client.ObjectKey{Name: stack.Name, Namespace: stack.Namespace}, &currentStack); err != nil {
+					log.Error(err, "Failed to get stack status", "stack", stack.Name)
+					allReady = false
+					continue
+				}
+
+				if currentStack.Status.Phase != desiredPhase {
+					log.Info("Waiting for stack phase",
+						"stack", stack.Name,
+						"currentPhase", currentStack.Status.Phase,
+						"desiredPhase", desiredPhase)
+					allReady = false
+				}
+			}
+
+			if allReady {
+				log.Info("All stacks reached desired phase", "phase", desiredPhase, "count", len(stacks))
+				return nil
+			}
+		}
+	}
+}
+
+// executeSnapshotTask creates volume snapshots for the given stacks
+func (r *LifecycleReconciler) executeSnapshotTask(ctx context.Context, lifecycle *envv1alpha1.Lifecycle, stacks []envv1alpha1.Stack) (int, error) {
+	log := logf.FromContext(ctx).WithValues("lifecycle", lifecycle.Name)
+
+	if !r.Config.ObjectStorage.Enabled {
+		return 0, fmt.Errorf("object storage is not enabled in controller config")
+	}
+
+	snapshotsCreated := 0
+	var errs []error
+
+	for _, stack := range stacks {
+		// Get PVCs in the stack's namespace
+		var pvcList corev1.PersistentVolumeClaimList
+		if err := r.List(ctx, &pvcList, client.InNamespace(stack.Namespace)); err != nil {
+			errs = append(errs, fmt.Errorf("failed to list PVCs for stack %s: %w", stack.Name, err))
+			continue
+		}
+
+		// Get the blueprint to extract repo info from labels
+		var blueprint envv1alpha1.Blueprint
+		if err := r.Get(ctx, client.ObjectKey{Name: stack.Spec.BlueprintReference, Namespace: stack.Namespace}, &blueprint); err != nil {
+			errs = append(errs, fmt.Errorf("failed to get blueprint for stack %s: %w", stack.Name, err))
+			continue
+		}
+
+		// Get repository from blueprint label (set during blueprint creation)
+		repo := blueprint.Labels["env.lissto.dev/repository"]
+		if repo == "" {
+			log.Info("Skipping stack - blueprint has no repository label", "stack", stack.Name, "blueprint", blueprint.Name)
+			continue
+		}
+
+		for _, pvc := range pvcList.Items {
+			// Extract volume identifier from PVC labels/annotations
+			serviceName := pvc.Labels["app.kubernetes.io/component"]
+			if serviceName == "" {
+				serviceName = pvc.Labels["app"]
+			}
+			if serviceName == "" {
+				log.Info("Skipping PVC without service label", "pvc", pvc.Name)
+				continue
+			}
+
+			// Get image from stack spec
+			imageInfo, ok := stack.Spec.Images[serviceName]
+			if !ok {
+				log.Info("Skipping PVC - service not found in stack images", "pvc", pvc.Name, "service", serviceName)
+				continue
+			}
+
+			// Get mount path from PVC annotations (set during stack creation)
+			mountPath := pvc.Annotations["env.lissto.dev/mount-path"]
+			if mountPath == "" {
+				mountPath = "/data" // Default mount path
+			}
+
+			// Create volume identifier
+			volumeID := envv1alpha1.VolumeIdentifier{
+				Repo:        repo,
+				ServiceName: serviceName,
+				Image:       imageInfo.Image,
+				MountPath:   mountPath,
+			}
+
+			// Generate snapshot name
+			suffix := fmt.Sprintf("%d", time.Now().Unix())
+			snapshotName := snapshot.GenerateSnapshotName(serviceName, suffix)
+
+			// Get user and env from namespace or stack
+			user := stack.Namespace // Convention: namespace is user-based
+			env := stack.Spec.Env
+
+			// Generate storage path
+			storagePath := snapshot.GenerateStoragePath(user, env, volumeID, snapshotName)
+
+			// Create VolumeSnapshot CR
+			vs := &envv1alpha1.VolumeSnapshot{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      snapshotName,
+					Namespace: stack.Namespace,
+					Labels:    snapshot.GetVolumeSnapshotLabels(user, env, serviceName, volumeID),
+					Annotations: map[string]string{
+						envv1alpha1.VolumeSnapshotAnnotationSourceBlueprint: blueprint.Name,
+					},
+				},
+				Spec: envv1alpha1.VolumeSnapshotSpec{
+					VolumeIdentifier: volumeID,
+				},
+				Status: envv1alpha1.VolumeSnapshotStatus{
+					Phase:       envv1alpha1.VolumeSnapshotPhasePending,
+					StoragePath: storagePath,
+				},
+			}
+
+			if err := r.Create(ctx, vs); err != nil {
+				errs = append(errs, fmt.Errorf("failed to create VolumeSnapshot for PVC %s: %w", pvc.Name, err))
+				continue
+			}
+
+			// Create snapshot job
+			jobConfig := snapshot.SnapshotJobConfig{
+				Name:               snapshot.GenerateSnapshotJobName(snapshotName),
+				Namespace:          stack.Namespace,
+				PVCName:            pvc.Name,
+				StoragePath:        storagePath,
+				VolumeSnapshotName: snapshotName,
+				Labels:             snapshot.GetVolumeSnapshotLabels(user, env, serviceName, volumeID),
+			}
+
+			job := snapshot.BuildSnapshotJob(jobConfig)
+			if err := r.Create(ctx, job); err != nil {
+				errs = append(errs, fmt.Errorf("failed to create snapshot job for PVC %s: %w", pvc.Name, err))
+				continue
+			}
+
+			// Update VolumeSnapshot with job name
+			vs.Status.JobName = job.Name
+			if err := r.Status().Update(ctx, vs); err != nil {
+				log.Error(err, "Failed to update VolumeSnapshot status with job name", "volumeSnapshot", vs.Name)
+			}
+
+			snapshotsCreated++
+			log.Info("Created volume snapshot", "volumeSnapshot", snapshotName, "pvc", pvc.Name, "storagePath", storagePath)
+		}
+	}
+
+	if len(errs) > 0 {
+		return snapshotsCreated, fmt.Errorf("failed to create some snapshots: %v", errs)
+	}
+
+	return snapshotsCreated, nil
+}
+
+// executeScaleUpTask resumes all stacks by setting spec.suspended=false
+func (r *LifecycleReconciler) executeScaleUpTask(ctx context.Context, lifecycle *envv1alpha1.Lifecycle, stacks []envv1alpha1.Stack) error {
+	log := logf.FromContext(ctx).WithValues("lifecycle", lifecycle.Name)
+
+	var errs []error
+
+	// Set suspended=false on all stacks
+	for _, stack := range stacks {
+		// Fetch current stack state
+		var currentStack envv1alpha1.Stack
+		if err := r.Get(ctx, client.ObjectKey{Name: stack.Name, Namespace: stack.Namespace}, &currentStack); err != nil {
+			errs = append(errs, fmt.Errorf("failed to get stack %s/%s: %w", stack.Namespace, stack.Name, err))
+			continue
+		}
+
+		// Skip if already running
+		if !currentStack.Spec.Suspended {
+			log.Info("Stack already running", "stack", stack.Name, "namespace", stack.Namespace)
+			continue
+		}
+
+		log.Info("Resuming stack", "stack", stack.Name, "namespace", stack.Namespace)
+
+		// Update stack to not suspended
+		currentStack.Spec.Suspended = false
+		if err := r.Update(ctx, &currentStack); err != nil {
+			errs = append(errs, fmt.Errorf("failed to resume stack %s/%s: %w", stack.Namespace, stack.Name, err))
+			continue
+		}
+	}
+
+	// Wait for all stacks to reach Running phase
+	if err := r.waitForStacksPhase(ctx, stacks, envv1alpha1.StackPhaseRunning, DefaultStackSuspendTimeout); err != nil {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("failed to resume some stacks: %v", errs)
+	}
+
+	log.Info("All stacks resumed", "count", len(stacks))
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

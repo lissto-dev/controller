@@ -1,0 +1,56 @@
+# ValidatingAdmissionPolicy to prevent race conditions during stack phase transitions
+# Requires Kubernetes 1.28+ (ValidatingAdmissionPolicy GA in 1.30+)
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: stack-transition-lock
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["env.lissto.dev"]
+        apiVersions: ["v1alpha1"]
+        resources: ["stacks"]
+        operations: ["UPDATE"]
+  validations:
+    # Block suspended changes during Suspending phase
+    - expression: >
+        !has(oldObject.status) || 
+        !has(oldObject.status.phase) ||
+        oldObject.status.phase != 'Suspending' || 
+        object.spec.suspended == oldObject.spec.suspended
+      message: "cannot change 'suspended' while stack is Suspending"
+    # Block suspended changes during Resuming phase
+    - expression: >
+        !has(oldObject.status) ||
+        !has(oldObject.status.phase) ||
+        oldObject.status.phase != 'Resuming' || 
+        object.spec.suspended == oldObject.spec.suspended
+      message: "cannot change 'suspended' while stack is Resuming"
+    # Block suspendedServices changes during Suspending phase
+    - expression: >
+        !has(oldObject.status) || 
+        !has(oldObject.status.phase) ||
+        oldObject.status.phase != 'Suspending' ||
+        ((!has(object.spec.suspendedServices) || size(object.spec.suspendedServices) == 0) && 
+         (!has(oldObject.spec.suspendedServices) || size(oldObject.spec.suspendedServices) == 0)) ||
+        object.spec.suspendedServices == oldObject.spec.suspendedServices
+      message: "cannot change 'suspendedServices' while stack is Suspending"
+    # Block suspendedServices changes during Resuming phase
+    - expression: >
+        !has(oldObject.status) ||
+        !has(oldObject.status.phase) ||
+        oldObject.status.phase != 'Resuming' ||
+        ((!has(object.spec.suspendedServices) || size(object.spec.suspendedServices) == 0) && 
+         (!has(oldObject.spec.suspendedServices) || size(oldObject.spec.suspendedServices) == 0)) ||
+        object.spec.suspendedServices == oldObject.spec.suspendedServices
+      message: "cannot change 'suspendedServices' while stack is Resuming"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: stack-transition-lock-binding
+spec:
+  policyName: stack-transition-lock
+  validationActions: [Deny]
+  matchResources: {}

@@ -4,18 +4,54 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/lissto-dev/controller/pkg/namespace"
 	"gopkg.in/yaml.v3"
 )
 
+// Default values
+const (
+	DefaultSuspendTimeout = 5 * time.Minute
+)
+
 // Config holds the operator configuration
 type Config struct {
-	API        APIConfig             `yaml:"api"`
-	Logging    LoggingConfig         `yaml:"logging"`
-	Namespaces NamespacesConfig      `yaml:"namespaces"`
-	Repos      map[string]RepoConfig `yaml:"repos"`
-	Stacks     StacksConfig          `yaml:"stacks"`
+	API           APIConfig             `yaml:"api"`
+	Logging       LoggingConfig         `yaml:"logging"`
+	Namespaces    NamespacesConfig      `yaml:"namespaces"`
+	Repos         map[string]RepoConfig `yaml:"repos"`
+	Stacks        StacksConfig          `yaml:"stacks"`
+	ObjectStorage ObjectStorageConfig   `yaml:"objectStorage,omitempty"`
+	Stack         StackConfig           `yaml:"stack,omitempty"`
+}
+
+// StackConfig holds stack-level configuration
+type StackConfig struct {
+	// DefaultSuspendTimeout is the default timeout for waiting for workloads to terminate
+	// when suspending a stack. Can be overridden per-stack via spec.suspendTimeout.
+	// Default: 5m
+	DefaultSuspendTimeout time.Duration `yaml:"defaultSuspendTimeout,omitempty"`
+}
+
+// GetSuspendTimeout returns the configured suspend timeout or the default
+func (c *Config) GetSuspendTimeout() time.Duration {
+	if c.Stack.DefaultSuspendTimeout > 0 {
+		return c.Stack.DefaultSuspendTimeout
+	}
+	return DefaultSuspendTimeout
+}
+
+// ObjectStorageConfig holds object storage configuration for volume snapshots
+// Conventions:
+// - Secret: "lissto-object-storage" in "lissto-system" namespace
+// - Agent image: ghcr.io/lissto-dev/snapshot-agent:v1
+// - Path: {user}/{env}/{repo-hash}/{service}/{mountPath-hash}/{snapshot-id}.tar.gz
+// - Compression: always gzip
+type ObjectStorageConfig struct {
+	// Enabled indicates whether object storage is configured
+	// +optional
+	Enabled bool `yaml:"enabled,omitempty"`
 }
 
 // APIConfig holds API configuration
