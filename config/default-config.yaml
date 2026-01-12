@@ -28,3 +28,5 @@ stacks:
       ingressClass: "haproxy-public"
       hostSuffix: ".dev-public.lissto.dev"
       tlsSecret: "wildcard-internet-tls"
+  suspension:
+    timeout: 5m

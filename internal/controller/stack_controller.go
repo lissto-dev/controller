@@ -19,14 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
+	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -37,7 +32,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	envv1alpha1 "github.com/lissto-dev/controller/api/v1alpha1"
+	stackconfig "github.com/lissto-dev/controller/internal/stack/config"
+	"github.com/lissto-dev/controller/internal/stack/image"
+	"github.com/lissto-dev/controller/internal/stack/manifest"
+	"github.com/lissto-dev/controller/internal/stack/resource"
+	"github.com/lissto-dev/controller/internal/stack/restore"
+	"github.com/lissto-dev/controller/internal/stack/status"
+	"github.com/lissto-dev/controller/internal/stack/suspension"
 	"github.com/lissto-dev/controller/pkg/config"
+	"github.com/lissto-dev/controller/pkg/util"
 )
 
 const stackFinalizerName = "stack.lissto.dev/config-cleanup"
@@ -48,6 +51,32 @@ type StackReconciler struct {
 	Scheme   *runtime.Scheme
 	Config   *config.Config
 	Recorder record.EventRecorder
+
+	// Domain services
+	manifestFetcher  *manifest.Fetcher
+	imageInjector    *image.Injector
+	resourceApplier  *resource.Applier
+	resourceCleaner  *resource.Cleaner
+	configDiscoverer *stackconfig.Discoverer
+	configResolver   *stackconfig.Resolver
+	configInjector   *stackconfig.Injector
+	secretCopier     *stackconfig.SecretCopier
+	statusUpdater    *status.Updater
+	restoreHandler   *restore.Handler
+}
+
+// InitServices initializes the domain services (call after Client is set)
+func (r *StackReconciler) InitServices() {
+	r.manifestFetcher = manifest.NewFetcher(r.Client)
+	r.imageInjector = image.NewInjector()
+	r.resourceApplier = resource.NewApplier(r.Client, r.Scheme)
+	r.resourceCleaner = resource.NewCleaner(r.Client)
+	r.configDiscoverer = stackconfig.NewDiscoverer(r.Client, r.Config.Namespaces.Global)
+	r.configResolver = stackconfig.NewResolver()
+	r.configInjector = stackconfig.NewInjector()
+	r.secretCopier = stackconfig.NewSecretCopier(r.Client, r.Scheme)
+	r.statusUpdater = status.NewUpdater(r.Client, r.Recorder)
+	r.restoreHandler = restore.NewHandler(r.Client)
 }
 
 // +kubebuilder:rbac:groups=env.lissto.dev,resources=stacks,verbs=get;list;watch;create;update;patch;delete
@@ -63,726 +92,340 @@ type StackReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Stack object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.1/pkg/reconcile
+// Reconcile is part of the main kubernetes reconciliation loop
 func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// Fetch the Stack instance
 	stack := &envv1alpha1.Stack{}
 	if err := r.Get(ctx, req.NamespacedName, stack); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("Reconciling Stack", "name", stack.Name, "namespace", stack.Namespace)
+	log.Info("Reconciling Stack", "name", stack.Name, "namespace", stack.Namespace,
+		"suspension", stack.Spec.Suspension, "phase", stack.Status.Phase)
 
-	// Handle finalizer for cleanup
+	// Handle finalizer
+	if shouldReturn, err := r.handleFinalizer(ctx, stack); shouldReturn {
+		return ctrl.Result{}, err
+	}
+
+	// Fetch and parse manifests
+	objects, err := r.fetchAndParseManifests(ctx, stack)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Validate resources
+	if err := suspension.ValidateResourceAnnotations(objects); err != nil {
+		log.Error(err, "Resource validation failed")
+		r.Recorder.Eventf(stack, corev1.EventTypeWarning, "ValidationFailed",
+			"Resource validation failed: %v", err)
+		r.statusUpdater.UpdateWithError(ctx, stack, err)
+		return ctrl.Result{}, err
+	}
+
+	// Inject config
+	configResult := r.injectConfig(ctx, stack, objects)
+
+	// Inject images
+	imageWarnings := r.imageInjector.Inject(ctx, objects, stack.Spec.Images)
+
+	// Categorize and apply resources
+	stateResources, workloadsToApply, workloadsToDelete := suspension.CategorizeResources(stack, objects)
+
+	log.Info("Resource categorization",
+		"stateResources", len(stateResources),
+		"workloadsToApply", len(workloadsToApply),
+		"workloadsToDelete", len(workloadsToDelete))
+
+	// Apply state resources
+	stateResults := r.resourceApplier.Apply(ctx, stateResources, stack.Namespace)
+	r.resourceApplier.SetOwnerReferences(ctx, stack, stateResources, stateResults)
+
+	// Handle restore if needed
+	if result, done := r.handleRestore(ctx, stack, stateResources); done {
+		return result, nil
+	}
+
+	// Delete suspended workloads
+	for _, obj := range workloadsToDelete {
+		if err := r.resourceApplier.Delete(ctx, obj, stack.Namespace); err != nil {
+			log.Error(err, "Failed to delete workload resource",
+				"kind", obj.GetKind(), "name", obj.GetName())
+		}
+	}
+
+	// Apply running workloads
+	workloadResults := r.resourceApplier.Apply(ctx, workloadsToApply, stack.Namespace)
+	r.resourceApplier.SetOwnerReferences(ctx, stack, workloadsToApply, workloadResults)
+
+	// Check workload termination
+	allWorkloadsTerminated := true
+	if len(workloadsToDelete) > 0 {
+		terminated, err := r.waitForWorkloadsTermination(ctx, stack)
+		if err != nil {
+			log.Error(err, "Error checking workload termination")
+		}
+		allWorkloadsTerminated = terminated
+	}
+
+	// Update phase
+	r.updatePhase(ctx, stack, stateResources, workloadsToApply, workloadsToDelete, allWorkloadsTerminated)
+
+	// Update service statuses
+	r.statusUpdater.UpdateServiceStatuses(ctx, stack, objects)
+
+	// Update status
+	results := append(stateResults, workloadResults...)
+	r.statusUpdater.Update(ctx, stack, status.UpdateInput{
+		Results:       results,
+		ImageWarnings: imageWarnings,
+		ConfigResult:  configResult,
+	})
+
+	// Requeue if suspending
+	if stack.Status.Phase == envv1alpha1.StackPhaseSuspending {
+		log.Info("Stack suspending, requeuing to check termination")
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	log.Info("Stack reconciliation complete", "name", stack.Name, "phase", stack.Status.Phase)
+	return ctrl.Result{}, nil
+}
+
+// handleFinalizer manages the stack finalizer.
+// Returns (shouldReturn, err) where shouldReturn indicates if the caller should return early.
+func (r *StackReconciler) handleFinalizer(ctx context.Context, stack *envv1alpha1.Stack) (bool, error) {
+	log := logf.FromContext(ctx)
+
 	if stack.DeletionTimestamp.IsZero() {
-		// Stack is not being deleted, ensure finalizer is present
 		if !controllerutil.ContainsFinalizer(stack, stackFinalizerName) {
 			controllerutil.AddFinalizer(stack, stackFinalizerName)
 			if err := r.Update(ctx, stack); err != nil {
 				log.Error(err, "Failed to add finalizer")
-				return ctrl.Result{}, err
+				return true, err
 			}
 			log.Info("Added finalizer to Stack")
 		}
-	} else {
-		// Stack is being deleted, run cleanup
-		if controllerutil.ContainsFinalizer(stack, stackFinalizerName) {
-			// Run comprehensive cleanup as safety net
-			// Owner references should handle most cleanup, but this ensures everything is gone
-			if err := r.cleanupStackResources(ctx, stack); err != nil {
-				log.Error(err, "Failed to cleanup stack resources")
-				return ctrl.Result{}, err
-			}
-
-			// Remove finalizer
-			controllerutil.RemoveFinalizer(stack, stackFinalizerName)
-			if err := r.Update(ctx, stack); err != nil {
-				log.Error(err, "Failed to remove finalizer")
-				return ctrl.Result{}, err
-			}
-			log.Info("Removed finalizer from Stack")
-		}
-		// Stop reconciliation as the Stack is being deleted
-		return ctrl.Result{}, nil
+		return false, nil
 	}
 
-	// Fetch manifests from ConfigMap
+	// Stack is being deleted
+	if controllerutil.ContainsFinalizer(stack, stackFinalizerName) {
+		if err := r.resourceCleaner.CleanupStackResources(ctx, stack.Name, stack.Namespace, stack.UID); err != nil {
+			log.Error(err, "Failed to cleanup stack resources")
+			return true, err
+		}
+
+		controllerutil.RemoveFinalizer(stack, stackFinalizerName)
+		if err := r.Update(ctx, stack); err != nil {
+			log.Error(err, "Failed to remove finalizer")
+			return true, err
+		}
+		log.Info("Removed finalizer from Stack")
+	}
+
+	return true, nil
+}
+
+// fetchAndParseManifests fetches and parses manifests from ConfigMap
+func (r *StackReconciler) fetchAndParseManifests(ctx context.Context, stack *envv1alpha1.Stack) ([]*unstructured.Unstructured, error) {
+	log := logf.FromContext(ctx)
+
 	configMapName := stack.Spec.ManifestsConfigMapRef
 	if configMapName == "" {
 		log.Error(nil, "Stack has no manifests ConfigMap reference")
-		return ctrl.Result{}, nil
+		return nil, fmt.Errorf("stack has no manifests ConfigMap reference")
 	}
 
-	manifests, err := r.fetchManifests(ctx, stack.Namespace, configMapName)
+	objects, err := r.manifestFetcher.FetchAndParse(ctx, stack.Namespace, configMapName)
 	if err != nil {
-		log.Error(err, "Failed to fetch manifests from ConfigMap")
-		r.updateStackStatus(ctx, stack, nil, nil, nil, fmt.Errorf("failed to fetch manifests: %w", err))
-		return ctrl.Result{}, err
-	}
-
-	// Parse manifests into Kubernetes objects
-	objects, err := parseManifests(manifests)
-	if err != nil {
-		log.Error(err, "Failed to parse manifests")
-		r.updateStackStatus(ctx, stack, nil, nil, nil, fmt.Errorf("failed to parse manifests: %w", err))
-		return ctrl.Result{}, err
+		log.Error(err, "Failed to fetch/parse manifests from ConfigMap")
+		r.statusUpdater.UpdateWithError(ctx, stack, fmt.Errorf("failed to fetch manifests: %w", err))
+		return nil, err
 	}
 
 	log.Info("Parsed manifests", "count", len(objects))
+	return objects, nil
+}
 
-	// Fetch blueprint for config discovery
+// injectConfig discovers and injects config into workloads
+func (r *StackReconciler) injectConfig(ctx context.Context, stack *envv1alpha1.Stack, objects []*unstructured.Unstructured) *status.ConfigResult {
+	log := logf.FromContext(ctx)
+
 	blueprint, err := r.getBlueprint(ctx, stack)
 	if err != nil {
 		log.Error(err, "Failed to fetch blueprint for config discovery")
-		// Continue without config injection - not fatal
+		return nil
 	}
 
-	// Discover and inject config (variables and secrets)
-	var configResult *ConfigInjectionResult
-	if blueprint != nil {
-		variables, _ := r.discoverVariables(ctx, stack, blueprint)
-		secrets, _ := r.discoverSecrets(ctx, stack, blueprint)
-
-		mergedVars := r.resolveVariables(variables)
-		resolvedKeys := r.resolveSecretKeys(secrets)
-
-		// Copy secrets to stack namespace
-		stackSecretName := ""
-		var missingSecretKeys map[string][]string
-		if len(resolvedKeys) > 0 {
-			stackSecret, missing, err := r.copySecretsToStackNamespace(ctx, stack, resolvedKeys)
-			missingSecretKeys = missing
-			if err != nil {
-				log.Error(err, "Failed to copy secrets to stack namespace")
-			} else if stackSecret != nil {
-				stackSecretName = stackSecret.Name
-			}
-
-			// Emit events for missing keys
-			if len(missingSecretKeys) > 0 {
-				for secretRef, keys := range missingSecretKeys {
-					r.Recorder.Eventf(stack, corev1.EventTypeWarning, "MissingSecretKeys",
-						"Secret %s is missing keys: %v", secretRef, keys)
-				}
-			}
-		}
-
-		// Inject config into workloads (deployments and pods)
-		// Extract stack metadata for injection
-		stackMetadata := extractStackMetadata(stack)
-		configResult = r.injectConfigIntoWorkloads(ctx, objects, mergedVars, resolvedKeys, stackSecretName, stackMetadata)
-		if configResult != nil {
-			configResult.MissingSecretKeys = missingSecretKeys
-
-			log.Info("Config injection complete",
-				"variables", configResult.VariablesInjected,
-				"secrets", configResult.SecretsInjected,
-				"metadata", configResult.MetadataInjected,
-				"missingKeys", len(missingSecretKeys))
-
-			// Emit events for config injection warnings (e.g., non-existent key mappings)
-			for _, warning := range configResult.Warnings {
-				r.Recorder.Eventf(stack, corev1.EventTypeWarning, "ConfigInjectionWarning", warning)
-			}
-		}
+	repository := ""
+	if blueprint != nil && blueprint.Annotations != nil {
+		repository = blueprint.Annotations["lissto.dev/repository"]
 	}
 
-	// Inject images from Stack spec into deployments
-	imageWarnings := r.injectImages(ctx, objects, stack.Spec.Images)
+	variables, _ := r.configDiscoverer.DiscoverVariables(ctx, stack, repository)
+	secrets, _ := r.configDiscoverer.DiscoverSecrets(ctx, stack, repository)
 
-	// Apply all resources
-	results := r.applyResources(ctx, objects, stack.Namespace)
+	mergedVars := r.configResolver.ResolveVariables(variables)
+	resolvedKeys := r.configResolver.ResolveSecretKeys(secrets)
 
-	// Set owner references on successfully applied resources (after apply)
-	// This ensures they get garbage collected when Stack is deleted
-	r.setOwnerReferences(ctx, stack, objects, results)
+	var stackSecretName string
+	var missingSecretKeys map[string][]string
 
-	// Update Stack status with results
-	r.updateStackStatus(ctx, stack, results, imageWarnings, configResult, nil)
-
-	log.Info("Stack reconciliation complete", "name", stack.Name)
-	return ctrl.Result{}, nil
-}
-
-// ResourceResult tracks application result
-type ResourceResult struct {
-	Kind    string
-	Name    string
-	Applied bool
-	Error   error
-}
-
-// ImageWarning tracks image injection issues
-type ImageWarning struct {
-	Service         string
-	Deployment      string
-	TargetContainer string
-	Message         string
-}
-
-// fetchManifests retrieves manifests from ConfigMap
-func (r *StackReconciler) fetchManifests(ctx context.Context, namespace, configMapName string) (string, error) {
-	configMap := &corev1.ConfigMap{}
-	if err := r.Get(ctx, client.ObjectKey{
-		Namespace: namespace,
-		Name:      configMapName,
-	}, configMap); err != nil {
-		return "", err
-	}
-
-	manifests, ok := configMap.Data["manifests.yaml"]
-	if !ok {
-		return "", fmt.Errorf("manifests.yaml not found in ConfigMap")
-	}
-
-	return manifests, nil
-}
-
-// injectImages updates deployment and pod container images from Stack spec
-func (r *StackReconciler) injectImages(ctx context.Context, objects []*unstructured.Unstructured, images map[string]envv1alpha1.ImageInfo) []ImageWarning {
-	log := logf.FromContext(ctx)
-	var warnings []ImageWarning
-
-	for _, obj := range objects {
-		// Support both Deployment and Pod
-		if obj.GetKind() != kindDeployment && obj.GetKind() != kindPod {
-			continue
-		}
-
-		resourceKind := obj.GetKind()
-		resourceName := obj.GetName()
-
-		// Get containers path based on resource type
-		containersPath := getContainersPath(resourceKind)
-
-		// Get the service name from the resource's labels
-		// The service name is stored in the "io.kompose.service" label
-		labels := obj.GetLabels()
-		serviceName, ok := labels["io.kompose.service"]
-		if !ok {
-			log.V(1).Info("Resource missing io.kompose.service label, skipping image injection",
-				"kind", resourceKind,
-				"name", resourceName)
-			warnings = append(warnings, ImageWarning{
-				Deployment: resourceName,
-				Message:    fmt.Sprintf("%s missing io.kompose.service label", resourceKind),
-			})
-			continue
-		}
-
-		// Look up image by service name
-		imageInfo, exists := images[serviceName]
-		if !exists {
-			log.V(1).Info("No image found for service",
-				"kind", resourceKind,
-				"name", resourceName,
-				"service", serviceName)
-			warnings = append(warnings, ImageWarning{
-				Service:    serviceName,
-				Deployment: resourceName,
-				Message:    "No image specification found for service",
-			})
-			continue
-		}
-
-		// Get main containers (not init containers)
-		containers, found, err := unstructured.NestedSlice(obj.Object, containersPath...)
-		if err != nil || !found {
-			log.Error(err, "Failed to get containers",
-				"kind", resourceKind,
-				"name", resourceName)
-			warnings = append(warnings, ImageWarning{
-				Service:    serviceName,
-				Deployment: resourceName,
-				Message:    fmt.Sprintf("Failed to get containers: %v", err),
-			})
-			continue
-		}
-
-		// Determine target container name
-		targetContainerName := imageInfo.ContainerName
-		if targetContainerName == "" {
-			targetContainerName = serviceName // Default to service name
-		}
-
-		// Update matching containers
-		updated := false
-		for i, container := range containers {
-			containerMap, ok := container.(map[string]interface{})
-			if !ok {
-				continue
-			}
-
-			containerName, _, _ := unstructured.NestedString(containerMap, "name")
-
-			// Match by target container name
-			if containerName == targetContainerName {
-				containerMap["image"] = imageInfo.Digest
-				containers[i] = containerMap
-				updated = true
-
-				log.Info("Injected image",
-					"kind", resourceKind,
-					"name", resourceName,
-					"service", serviceName,
-					"container", containerName,
-					"image", imageInfo.Digest)
-			}
-		}
-
-		if !updated {
-			log.Info("No matching container found for image injection",
-				"kind", resourceKind,
-				"name", resourceName,
-				"service", serviceName,
-				"targetContainer", targetContainerName)
-			warnings = append(warnings, ImageWarning{
-				Service:         serviceName,
-				Deployment:      resourceName,
-				TargetContainer: targetContainerName,
-				Message:         fmt.Sprintf("No container named '%s' found in %s", targetContainerName, resourceKind),
-			})
-		}
-
-		// Write back updated containers
-		if updated {
-			if err := unstructured.SetNestedSlice(obj.Object, containers, containersPath...); err != nil {
-				log.Error(err, "Failed to set containers",
-					"kind", resourceKind,
-					"name", resourceName)
-				warnings = append(warnings, ImageWarning{
-					Service:    serviceName,
-					Deployment: resourceName,
-					Message:    fmt.Sprintf("Failed to update containers: %v", err),
-				})
-			}
-		}
-	}
-
-	return warnings
-}
-
-// applyResources applies all resources to cluster using server-side apply
-func (r *StackReconciler) applyResources(ctx context.Context, objects []*unstructured.Unstructured, namespace string) []ResourceResult {
-	log := logf.FromContext(ctx)
-	results := make([]ResourceResult, 0, len(objects))
-
-	for _, obj := range objects {
-		result := ResourceResult{
-			Kind: obj.GetKind(),
-			Name: obj.GetName(),
-		}
-
-		// Ensure the namespace is set on the object
-		obj.SetNamespace(namespace)
-
-		// Special handling for PVCs - they are immutable after creation
-		if obj.GetKind() == "PersistentVolumeClaim" {
-			// Check if PVC already exists
-			existing := &unstructured.Unstructured{}
-			existing.SetGroupVersionKind(obj.GroupVersionKind())
-			err := r.Get(ctx, client.ObjectKeyFromObject(obj), existing)
-
-			if err != nil {
-				// PVC doesn't exist, create it
-				if err := r.Create(ctx, obj); err != nil {
-					log.Error(err, "Failed to create PVC",
-						"name", obj.GetName())
-					result.Applied = false
-					result.Error = err
-				} else {
-					log.Info("Created PVC",
-						"name", obj.GetName())
-					result.Applied = true
-				}
-			} else {
-				// PVC exists, skip update (immutable)
-				log.Info("PVC already exists, skipping update (immutable)",
-					"name", obj.GetName())
-				result.Applied = true
-			}
-		} else {
-			// For other resources, use server-side apply with proper field management
-			// This allows proper updates and field ownership tracking
-			if err := r.Patch(ctx, obj, client.Apply, client.ForceOwnership, client.FieldOwner("stack-controller")); err != nil {
-				log.Error(err, "Failed to apply resource",
-					"kind", obj.GetKind(),
-					"name", obj.GetName())
-				result.Applied = false
-				result.Error = err
-			} else {
-				log.V(1).Info("Applied resource",
-					"kind", obj.GetKind(),
-					"name", obj.GetName())
-				result.Applied = true
-			}
-		}
-
-		results = append(results, result)
-	}
-
-	return results
-}
-
-// setOwnerReferences sets Stack as owner of all successfully applied resources
-func (r *StackReconciler) setOwnerReferences(ctx context.Context, stack *envv1alpha1.Stack,
-	objects []*unstructured.Unstructured, results []ResourceResult) {
-	log := logf.FromContext(ctx)
-
-	for i, result := range results {
-		if !result.Applied {
-			continue
-		}
-
-		// Fetch the latest version of the resource to avoid race conditions
-		obj := &unstructured.Unstructured{}
-		obj.SetGroupVersionKind(objects[i].GroupVersionKind())
-		obj.SetName(objects[i].GetName())
-		obj.SetNamespace(objects[i].GetNamespace())
-
-		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
-			log.Error(err, "Failed to fetch resource for owner reference",
-				"kind", obj.GetKind(),
-				"name", obj.GetName())
-			continue
-		}
-
-		// Check if owner reference already exists
-		ownerRefs := obj.GetOwnerReferences()
-		hasOwnerRef := false
-		for _, ref := range ownerRefs {
-			if ref.UID == stack.UID {
-				log.Info("Owner reference already exists",
-					"kind", obj.GetKind(),
-					"name", obj.GetName())
-				hasOwnerRef = true
-				break
-			}
-		}
-
-		// Skip setting owner reference if it already exists
-		if hasOwnerRef {
-			continue
-		}
-
-		if err := controllerutil.SetOwnerReference(stack, obj, r.Scheme); err != nil {
-			log.Error(err, "Failed to set owner reference",
-				"kind", obj.GetKind(),
-				"name", obj.GetName())
-			continue
-		}
-
-		if err := r.Update(ctx, obj); err != nil {
-			// Check if it's a conflict error (optimistic locking)
-			if apierrors.IsConflict(err) {
-				// Conflict errors are expected and will be retried - log at debug level
-				log.V(1).Info("Conflict updating resource with owner reference, will retry",
-					"kind", obj.GetKind(),
-					"name", obj.GetName())
-			} else {
-				// Real errors should be logged
-				log.Error(err, "Failed to update resource with owner reference",
-					"kind", obj.GetKind(),
-					"name", obj.GetName())
-			}
-		} else {
-			log.Info("Set owner reference",
-				"kind", obj.GetKind(),
-				"name", obj.GetName())
-		}
-	}
-}
-
-// updateStackStatus updates Stack conditions based on resource application results
-func (r *StackReconciler) updateStackStatus(ctx context.Context, stack *envv1alpha1.Stack,
-	results []ResourceResult, imageWarnings []ImageWarning, configResult *ConfigInjectionResult, parseError error) {
-	log := logf.FromContext(ctx)
-
-	conditions := []metav1.Condition{}
-
-	// Handle parse error
-	if parseError != nil {
-		conditions = append(conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionFalse,
-			ObservedGeneration: stack.Generation,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "ParseFailed",
-			Message:            parseError.Error(),
-		})
-
-		stack.Status.Conditions = conditions
-		// Update ObservedGeneration even on parse failure
-		stack.Status.ObservedGeneration = stack.Generation
-		if err := r.Status().Update(ctx, stack); err != nil {
-			log.Error(err, "Failed to update Stack status")
-		}
-		return
-	}
-
-	// Handle image injection warnings
-	if len(imageWarnings) > 0 {
-		// Create warning messages
-		warningMessages := make([]string, 0, len(imageWarnings))
-		for _, warning := range imageWarnings {
-			if warning.Service != "" {
-				warningMessages = append(warningMessages,
-					fmt.Sprintf("Service '%s' (deployment '%s'): %s", warning.Service, warning.Deployment, warning.Message))
-			} else {
-				warningMessages = append(warningMessages,
-					fmt.Sprintf("Deployment '%s': %s", warning.Deployment, warning.Message))
-			}
-		}
-
-		conditions = append(conditions, metav1.Condition{
-			Type:               "ImageInjection",
-			Status:             metav1.ConditionFalse,
-			ObservedGeneration: stack.Generation,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "ImageInjectionWarning",
-			Message:            strings.Join(warningMessages, "; "),
-		})
-	} else {
-		// All images injected successfully
-		conditions = append(conditions, metav1.Condition{
-			Type:               "ImageInjection",
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: stack.Generation,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "AllImagesInjected",
-			Message:            "All service images injected successfully",
-		})
-	}
-
-	// Handle config injection result
-	if configResult != nil {
-		hasMissingKeys := len(configResult.MissingSecretKeys) > 0
-		hasWarnings := len(configResult.Warnings) > 0
-
-		if hasMissingKeys || hasWarnings {
-			// Build warning message
-			var messages []string
-
-			if hasMissingKeys {
-				keyMsgs := []string{}
-				for secretRef, keys := range configResult.MissingSecretKeys {
-					keyMsgs = append(keyMsgs, fmt.Sprintf("%s[%v]", secretRef, keys))
-				}
-				messages = append(messages, "Missing secret keys: "+strings.Join(keyMsgs, ", "))
-			}
-
-			if hasWarnings {
-				messages = append(messages, configResult.Warnings...)
-			}
-
-			reason := "ConfigInjectionWarning"
-			if hasMissingKeys {
-				reason = "MissingSecretKeys"
-			}
-
-			conditions = append(conditions, metav1.Condition{
-				Type:               "ConfigInjection",
-				Status:             metav1.ConditionFalse,
-				ObservedGeneration: stack.Generation,
-				LastTransitionTime: metav1.Now(),
-				Reason:             reason,
-				Message:            strings.Join(messages, "; "),
-			})
-		} else if configResult.VariablesInjected > 0 || configResult.SecretsInjected > 0 {
-			// Config injected successfully
-			conditions = append(conditions, metav1.Condition{
-				Type:               "ConfigInjection",
-				Status:             metav1.ConditionTrue,
-				ObservedGeneration: stack.Generation,
-				LastTransitionTime: metav1.Now(),
-				Reason:             "ConfigInjected",
-				Message:            fmt.Sprintf("Injected %d variables and %d secrets", configResult.VariablesInjected, configResult.SecretsInjected),
-			})
-		}
-	}
-
-	// Track resource conditions
-	hasFailures := false
-	for _, result := range results {
-		// Use a valid Kubernetes condition type format (lowercase, no slashes)
-		conditionType := fmt.Sprintf("Resource-%s-%s", strings.ToLower(result.Kind), result.Name)
-
-		if result.Applied {
-			conditions = append(conditions, metav1.Condition{
-				Type:               conditionType,
-				Status:             metav1.ConditionTrue,
-				ObservedGeneration: stack.Generation,
-				LastTransitionTime: metav1.Now(),
-				Reason:             "Applied",
-				Message:            "Resource applied successfully",
-			})
-		} else {
-			hasFailures = true
-			conditions = append(conditions, metav1.Condition{
-				Type:               conditionType,
-				Status:             metav1.ConditionFalse,
-				ObservedGeneration: stack.Generation,
-				LastTransitionTime: metav1.Now(),
-				Reason:             "Failed",
-				Message:            result.Error.Error(),
-			})
-		}
-	}
-
-	// Set overall Ready condition
-	readyCondition := metav1.Condition{
-		Type:               "Ready",
-		ObservedGeneration: stack.Generation,
-		LastTransitionTime: metav1.Now(),
-	}
-
-	if hasFailures {
-		readyCondition.Status = metav1.ConditionFalse
-		readyCondition.Reason = "PartialFailure"
-		readyCondition.Message = "Some resources failed to apply"
-	} else {
-		readyCondition.Status = metav1.ConditionTrue
-		readyCondition.Reason = "AllResourcesApplied"
-		readyCondition.Message = fmt.Sprintf("All %d resources applied successfully", len(results))
-	}
-
-	conditions = append([]metav1.Condition{readyCondition}, conditions...)
-	stack.Status.Conditions = conditions
-
-	// Update ObservedGeneration to indicate this spec version was reconciled
-	stack.Status.ObservedGeneration = stack.Generation
-
-	if err := r.Status().Update(ctx, stack); err != nil {
-		log.Error(err, "Failed to update Stack status")
-	}
-}
-
-// cleanupStackResources performs comprehensive cleanup of all Stack resources
-// This acts as a safety net in case owner references didn't work properly
-// cleanupStackResources cleans up resources owned by the Stack during deletion.
-// It intentionally returns nil even on partial failures to allow Stack deletion to proceed.
-//
-//nolint:unparam // error return is kept for interface consistency and future use
-func (r *StackReconciler) cleanupStackResources(ctx context.Context, stack *envv1alpha1.Stack) error {
-	log := logf.FromContext(ctx)
-
-	// List of resource types to cleanup (in deletion order)
-	// Owner references should have handled most of these, but we verify and cleanup as needed
-	resourceTypes := []struct {
-		name string
-		list client.ObjectList
-	}{
-		// Clean up workloads first (they may have finalizers)
-		{"Pods", &corev1.PodList{}},
-		{"Deployments", &appsv1.DeploymentList{}},
-
-		// Then networking
-		{"Ingresses", &networkingv1.IngressList{}},
-		{"Services", &corev1.ServiceList{}},
-
-		// Finally storage (in case workloads are holding them)
-		{"PersistentVolumeClaims", &corev1.PersistentVolumeClaimList{}},
-
-		// Secrets managed by controller
-		{"Secrets", &corev1.SecretList{}},
-	}
-
-	errorCount := 0
-	deletedCount := 0
-
-	for _, rt := range resourceTypes {
-		// List resources with Stack label (if they have it) or in Stack namespace
-		listOpts := []client.ListOption{
-			client.InNamespace(stack.Namespace),
-		}
-
-		if err := r.List(ctx, rt.list, listOpts...); err != nil {
-			log.Error(err, "Failed to list resources during cleanup", "type", rt.name)
-			errorCount++
-			continue
-		}
-
-		// Extract items from the list
-		items, err := meta.ExtractList(rt.list)
+	if len(resolvedKeys) > 0 {
+		stackSecret, missing, err := r.secretCopier.CopyToStackNamespace(ctx, stack, resolvedKeys)
+		missingSecretKeys = missing
 		if err != nil {
-			log.Error(err, "Failed to extract list items", "type", rt.name)
-			errorCount++
-			continue
+			log.Error(err, "Failed to copy secrets to stack namespace")
+		} else if stackSecret != nil {
+			stackSecretName = stackSecret.Name
 		}
 
-		// Check each resource to see if it's owned by this Stack
-		for _, item := range items {
-			obj, ok := item.(client.Object)
-			if !ok {
-				continue
-			}
-
-			// Check if this resource is owned by the Stack
-			isOwned := false
-			for _, ref := range obj.GetOwnerReferences() {
-				if ref.UID == stack.UID {
-					isOwned = true
-					break
-				}
-			}
-
-			// Also check for managed-by label (for secrets)
-			labels := obj.GetLabels()
-			if labels != nil && labels["lissto.dev/stack"] == stack.Name {
-				isOwned = true
-			}
-
-			if !isOwned {
-				continue
-			}
-
-			// Delete the resource
-			if err := r.Delete(ctx, obj); err != nil {
-				if !apierrors.IsNotFound(err) {
-					log.Error(err, "Failed to delete resource during cleanup",
-						"type", rt.name,
-						"name", obj.GetName())
-					errorCount++
-				}
-			} else {
-				log.Info("Deleted resource during cleanup",
-					"type", rt.name,
-					"name", obj.GetName())
-				deletedCount++
-			}
+		for secretRef, keys := range missingSecretKeys {
+			r.Recorder.Eventf(stack, corev1.EventTypeWarning, "MissingSecretKeys",
+				"Secret %s is missing keys: %v", secretRef, keys)
 		}
 	}
 
-	if deletedCount > 0 {
-		log.Info("Cleaned up Stack resources via finalizer",
-			"deleted", deletedCount,
-			"errors", errorCount,
-			"note", "Most resources should be auto-deleted by owner references")
-	}
+	metadata := stackconfig.ExtractStackMetadata(stack)
+	injectionResult := r.configInjector.Inject(ctx, objects, mergedVars, resolvedKeys, stackSecretName, metadata)
 
-	// Don't fail the finalizer if some resources couldn't be deleted
-	// Log errors but allow Stack deletion to proceed
-	if errorCount > 0 {
-		log.Error(nil, "Some resources failed to delete, but allowing Stack deletion to proceed",
-			"errorCount", errorCount)
+	if injectionResult != nil {
+		log.Info("Config injection complete",
+			"variables", injectionResult.VariablesInjected,
+			"secrets", injectionResult.SecretsInjected,
+			"metadata", injectionResult.MetadataInjected,
+			"missingKeys", len(missingSecretKeys))
+
+		for _, warning := range injectionResult.Warnings {
+			r.Recorder.Eventf(stack, corev1.EventTypeWarning, "ConfigInjectionWarning", warning)
+		}
+
+		return &status.ConfigResult{
+			VariablesInjected: injectionResult.VariablesInjected,
+			SecretsInjected:   injectionResult.SecretsInjected,
+			MetadataInjected:  injectionResult.MetadataInjected,
+			MissingSecretKeys: missingSecretKeys,
+			Warnings:          injectionResult.Warnings,
+		}
 	}
 
 	return nil
 }
 
+// handleRestore handles restoration from StackSnapshot
+func (r *StackReconciler) handleRestore(ctx context.Context, stack *envv1alpha1.Stack, stateResources []*unstructured.Unstructured) (ctrl.Result, bool) {
+	log := logf.FromContext(ctx)
+
+	var pvcObjects []*unstructured.Unstructured
+	for _, obj := range stateResources {
+		if obj.GetKind() == "PersistentVolumeClaim" {
+			pvcObjects = append(pvcObjects, obj)
+		}
+	}
+
+	if r.restoreHandler.NeedsRestore(stack) && len(pvcObjects) > 0 {
+		restoreComplete, restoreResults, err := r.restoreHandler.Restore(ctx, stack, pvcObjects)
+		if err != nil {
+			log.Error(err, "Failed to restore from snapshot")
+			r.Recorder.Eventf(stack, corev1.EventTypeWarning, "RestoreFailed",
+				"Failed to restore from snapshot: %v", err)
+		}
+
+		for _, result := range restoreResults {
+			if result.Error != nil {
+				log.Error(result.Error, "Resource restore failed",
+					"service", result.Service, "snapshot", result.SnapshotName)
+			}
+		}
+
+		if !restoreComplete {
+			log.Info("Restore in progress, requeuing", "results", len(restoreResults))
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, true
+		}
+
+		log.Info("Restore complete", "results", len(restoreResults))
+	}
+
+	return ctrl.Result{}, false
+}
+
+// updatePhase determines and updates the stack phase
+func (r *StackReconciler) updatePhase(ctx context.Context, stack *envv1alpha1.Stack,
+	stateResources, workloadsToApply, workloadsToDelete []*unstructured.Unstructured,
+	allWorkloadsTerminated bool) {
+
+	newPhase := suspension.DetermineStackPhase(stack, allWorkloadsTerminated)
+	oldPhase := stack.Status.Phase
+
+	if oldPhase == newPhase {
+		return
+	}
+
+	var reason, message string
+	switch newPhase {
+	case envv1alpha1.StackPhaseSuspending:
+		reason = "Suspending"
+		message = fmt.Sprintf("Suspending stack, deleting %d workload resources", len(workloadsToDelete))
+	case envv1alpha1.StackPhaseSuspended:
+		reason = "Suspended"
+		message = fmt.Sprintf("Stack suspended, %d state resources preserved", len(stateResources))
+	case envv1alpha1.StackPhaseResuming:
+		reason = "Resuming"
+		message = fmt.Sprintf("Resuming stack, recreating %d workload resources", len(workloadsToApply))
+	case envv1alpha1.StackPhaseRunning:
+		if oldPhase == "" {
+			reason = "StackCreated"
+			message = "Stack created and all resources applied"
+		} else {
+			reason = "Running"
+			message = fmt.Sprintf("Stack running, %d resources applied", len(stateResources)+len(workloadsToApply))
+		}
+	}
+
+	r.statusUpdater.TransitionPhase(ctx, stack, newPhase, reason, message)
+}
+
+// waitForWorkloadsTermination checks if all suspended workloads have terminated
+func (r *StackReconciler) waitForWorkloadsTermination(ctx context.Context, stack *envv1alpha1.Stack) (bool, error) {
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList, client.InNamespace(stack.Namespace)); err != nil {
+		return false, err
+	}
+
+	for _, pod := range podList.Items {
+		svc := pod.Labels["io.kompose.service"]
+		if svc != "" && suspension.ShouldSuspendService(stack, svc) {
+			if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+// getBlueprint fetches the blueprint referenced by the stack
+func (r *StackReconciler) getBlueprint(ctx context.Context, stack *envv1alpha1.Stack) (*envv1alpha1.Blueprint, error) {
+	namespace, name := util.ParseBlueprintReference(
+		stack.Spec.BlueprintReference,
+		stack.Namespace,
+		r.Config.Namespaces.Global,
+	)
+
+	blueprint := &envv1alpha1.Blueprint{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, blueprint); err != nil {
+		return nil, err
+	}
+
+	return blueprint, nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *StackReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.InitServices()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&envv1alpha1.Stack{}).
 		WithEventFilter(predicate.GenerationChangedPredicate{}).
